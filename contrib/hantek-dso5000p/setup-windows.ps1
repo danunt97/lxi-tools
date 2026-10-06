@@ -97,7 +97,7 @@ function Test-Scope {
     # PowerShell 5.1 wuerde stderr eines Programms sonst als Abbruchfehler werten
     $ErrorActionPreference = 'Continue'
     Push-Location $Dst
-    try { $out = & $Py dso5000p.py info 2>&1 | Out-String } finally { Pop-Location }
+    try { $out = & $Py dso5000p.py info 2>&1 | ForEach-Object { "$_" } | Out-String } finally { Pop-Location }
     return @{ ok = ($LASTEXITCODE -eq 0); text = $out }
 }
 

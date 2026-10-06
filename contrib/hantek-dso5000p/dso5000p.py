@@ -349,9 +349,17 @@ class UsbTransport:
         except (NotImplementedError, usb.core.USBError):
             pass  # not supported on Windows/macOS
         try:
-            dev.get_active_configuration()
-        except usb.core.USBError:
-            dev.set_configuration()
+            try:
+                dev.get_active_configuration()
+            except usb.core.USBError:
+                dev.set_configuration()
+        except NotImplementedError:
+            # libusb on Windows can only open devices bound to WinUSB/libusbK
+            raise ScopeError(
+                "Scope gefunden, aber Windows benutzt noch den Hantek-Treiber.\n"
+                "  Mit Zadig auf WinUSB umstellen: Options -> List All Devices, Geraet\n"
+                "  049F 505A waehlen (bei 'Interface 0'/'Interface 1' das Interface 0),\n"
+                "  WinUSB einstellen, Replace Driver, danach Scope neu anstecken.")
         try:
             usb.util.claim_interface(dev, INTERFACE)
         except usb.core.USBError as e:
@@ -843,6 +851,9 @@ def main(argv=None):
         args.func(dso, args)
     except ScopeError as e:
         print("Fehler: %s" % e, file=sys.stderr)
+        return 1
+    except Exception as e:  # USB errors etc.: one line instead of a traceback
+        print("Fehler: %s: %s" % (type(e).__name__, e), file=sys.stderr)
         return 1
     finally:
         if dso is not None:

@@ -229,6 +229,12 @@ class Cli(unittest.TestCase):
         self.assertEqual(d.main(["keys"]), 0)
         self.assertEqual(d.main(["key", "bogus"]), 1)
 
+    def test_unexpected_error_is_one_line(self):
+        def boom():
+            raise NotImplementedError("Operation not supported")
+        d.UsbTransport = boom
+        self.assertEqual(d.main(["info"]), 1)
+
     def test_plot_to_file(self):
         try:
             import matplotlib
