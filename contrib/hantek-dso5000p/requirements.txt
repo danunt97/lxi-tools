@@ -1,0 +1,3 @@
+pyusb>=1.2
+# optional, for "plot" and "live"
+matplotlib>=3.5
