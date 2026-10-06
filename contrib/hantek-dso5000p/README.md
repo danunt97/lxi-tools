@@ -38,6 +38,10 @@ Das Tool löst diesen Treiber automatisch. Ein separater Treiber ist unter Linux
 
 ### Windows
 
+**Kurzfassung:** `install-windows.bat` doppelklicken, Treiber mit Zadig umstellen (Schritt 3),
+dann `start-windows.bat` doppelklicken. Es öffnet sich ein Menü mit allen Funktionen.
+Screenshots und CSV-Dateien landen im selben Ordner.
+
 Der mitgelieferte **Hantek-Treiber funktioniert mit diesem Tool nicht**, denn `pyusb` braucht den
 generischen **WinUSB**-Treiber:
 
