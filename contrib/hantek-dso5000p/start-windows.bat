@@ -7,6 +7,7 @@ if exist "%~dp0python-path.txt" set /p PY=<"%~dp0python-path.txt"
 cls
 echo === Hantek DSO5102P ===
 echo.
+echo  G  Grafische Oberflaeche starten
 echo  1  Einstellungen anzeigen
 echo  2  Screenshot speichern (PNG)
 echo  3  Kurven als CSV speichern
@@ -18,6 +19,7 @@ echo  8  RUN/STOP druecken
 echo  0  Beenden
 echo.
 set /p wahl=Auswahl: 
+if /i "%wahl%"=="G" start "" "%PY%" dso5000p_gui.py
 if "%wahl%"=="1" "%PY%" dso5000p.py info
 if "%wahl%"=="2" "%PY%" dso5000p.py screenshot
 if "%wahl%"=="3" "%PY%" dso5000p.py capture

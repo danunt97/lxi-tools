@@ -274,6 +274,17 @@ class Settings:
         return _lookup(ACQ_MODE, self.raw["ACQURIE-MODE"])
 
 
+def settings_blob(raw):
+    """Inverse of Settings(): build the 208 byte blob from {name: value}."""
+    blob = bytearray(SETTINGS_LEN)
+    offset = 0
+    for name, size in SETTINGS_LAYOUT:
+        v = raw.get(name, 0) & ((1 << (8 * size)) - 1)
+        blob[offset:offset + size] = v.to_bytes(size, "little")
+        offset += size
+    return bytes(blob)
+
+
 def counts_to_volts(counts, channel_settings):
     """Convert sample counts (already 0x80 flipped) to volts at the probe tip.
 
@@ -300,19 +311,23 @@ def rgb565_to_rgb(raw):
     return bytes(out)
 
 
-def write_png(path, width, height, rgb):
-    """Minimal PNG writer, so no Pillow is needed."""
+def png_bytes(width, height, rgb, level=6):
+    """Minimal PNG encoder, so no Pillow is needed."""
     def chunk(tag, data):
         c = tag + data
         return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
 
     stride = width * 3
     rows = b"".join(b"\x00" + rgb[y * stride:(y + 1) * stride] for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, level))
+            + chunk(b"IEND", b""))
+
+
+def write_png(path, width, height, rgb):
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
-        f.write(chunk(b"IDAT", zlib.compress(rows, 6)))
-        f.write(chunk(b"IEND", b""))
+        f.write(png_bytes(width, height, rgb))
 
 
 # --------------------------------------------------------------------------
@@ -533,6 +548,136 @@ class DSO5000P:
 
 
 # --------------------------------------------------------------------------
+# simulated scope, for --demo and tests
+
+class SimTransport:
+    """Behaves like a DSO5102P on the wire: CH1 1 kHz sine, CH2 500 Hz square.
+    Reacts to the front panel keys for V/div, position, time/div, run/stop."""
+
+    def __init__(self):
+        import math
+        import random
+        self._math = math
+        self._rand = random.Random(1)
+        self.raw = {
+            "VERT-CH1-DISP": 1, "VERT-CH1-VB": 9, "VERT-CH1-POS": 25,
+            "VERT-CH2-DISP": 1, "VERT-CH2-VB": 10, "VERT-CH2-POS": -60 & 0xFFFF,
+            "TRIG-STATE": 1, "TRIG-MODE": 0, "HORIZ-TB": 15,
+            "TRIG-FREQUENCY": 1000000,
+        }
+        self.locked = False
+        self.out = []
+        self.phase = 0.0
+
+    # signals in volts at time t
+    def _signal(self, ch, t):
+        m = self._math
+        if ch == 1:
+            return 1.5 * m.sin(2 * m.pi * 1000 * t + self.phase) + self._rand.gauss(0, 0.01)
+        return (3.3 if (t * 500 + self.phase / (2 * m.pi)) % 1 < 0.5 else 0.0) + self._rand.gauss(0, 0.005)
+
+    def _counts(self, ch):
+        s = Settings(settings_blob(self.raw))
+        cs = s.channel(ch)
+        dt = s.sample_interval
+        out = []
+        for i in range(SAMPLES):
+            c = CENTRE_COUNT + cs["position"] + self._signal(ch, (i - SAMPLES / 2) * dt) / cs["volts_div"] * COUNTS_PER_DIV
+            out.append(max(0, min(255, int(round(c)))))
+        return out
+
+    def _render(self):
+        """Fake screen: graticule plus both traces, RGB565."""
+        w, h = SCREEN_W, SCREEN_H
+        px = bytearray(b"\x00\x00" * (w * h))
+        x0, y0, gw, gh = 0, 40, 800, 400
+
+        def put(x, y, col):
+            if 0 <= x < w and 0 <= y < h:
+                struct.pack_into("<H", px, 2 * (y * w + x), col)
+        for i in range(17):
+            for y in range(y0, y0 + gh, 4):
+                put(x0 + i * gw // 16, y, 0x4208)
+        for j in range(9):
+            for x in range(x0, x0 + gw, 4):
+                put(x, y0 + j * gh // 8, 0x4208)
+        for ch, col in ((1, 0xFFE0), (2, 0x07FF)):
+            if not self.raw["VERT-CH%d-DISP" % ch]:
+                continue
+            for i, c in enumerate(self._counts(ch)[::4]):
+                put(x0 + i, int(y0 + gh / 2 - (c - CENTRE_COUNT) * gh / 8 / COUNTS_PER_DIV), col)
+        return bytes(px)
+
+    def _key(self, code):
+        name = KEYS[code][0]
+        r = self.raw
+        step = {"VBADD": 1, "VBSUB": -1}
+        for ch in (1, 2):
+            p = "VT-CH%d-" % ch
+            if name.startswith(p):
+                k = name[len(p):-4]
+                if k in step:
+                    r["VERT-CH%d-VB" % ch] = max(0, min(len(VOLTS_DIV) - 1, r["VERT-CH%d-VB" % ch] + step[k]))
+                elif k in ("PADD", "PSUB"):
+                    pos = _signed16(r["VERT-CH%d-POS" % ch]) + (4 if k == "PADD" else -4)
+                    r["VERT-CH%d-POS" % ch] = max(-200, min(200, pos)) & 0xFFFF
+                elif k == "PZERO":
+                    r["VERT-CH%d-POS" % ch] = 0
+                elif k == "MENU":
+                    r["VERT-CH%d-DISP" % ch] ^= 1
+        if name == "HZ-TBADD-KEY":
+            r["HORIZ-TB"] = min(len(TIME_DIV) - 1, r["HORIZ-TB"] + 1)
+        elif name == "HZ-TBSUB-KEY":
+            r["HORIZ-TB"] = max(0, r["HORIZ-TB"] - 1)
+        elif name == "CT-RS-KEY":
+            r["TRIG-STATE"] ^= 1
+        elif name == "CT-AUTOSET-KEY":
+            r.update({"VERT-CH1-VB": 9, "VERT-CH2-VB": 10, "HORIZ-TB": 15, "TRIG-STATE": 1})
+
+    def write(self, data, _timeout_ms):
+        cmd, payload = decode(data)
+        q = self.out
+        rep = lambda p: q.append(encode(cmd | 0x80, p))
+        if cmd == CMD_READ_SETTINGS:
+            rep(settings_blob(self.raw))
+        elif cmd == CMD_ECHO:
+            rep(payload)
+        elif cmd == CMD_SYSTEM_TIME:
+            n = datetime.datetime.now()
+            rep(struct.pack("<H", n.year) + bytes([n.month, n.day, n.hour, n.minute, n.second]))
+        elif cmd == CMD_READ_SAMPLES:
+            ch = payload[1] + 1
+            if self.raw["TRIG-STATE"] and self.raw["VERT-CH%d-DISP" % ch]:
+                self.phase = self._rand.gauss(0, 0.02)
+                wire = bytes(c ^ 0x80 for c in self._counts(ch))
+                rep(bytes([0x00]) + struct.pack("<I", len(wire))[:3])
+                for i in range(0, len(wire), 1200):
+                    rep(bytes([0x01, ch - 1]) + wire[i:i + 1200])
+            rep(bytes([0x02, ch - 1]))
+        elif cmd == CMD_SCREENSHOT:
+            raw = self._render()
+            for i in range(0, len(raw), 10000):
+                rep(b"\x01" + raw[i:i + 10000])
+            rep(b"\x02")
+        elif cmd == CMD_KEY:
+            self._key(payload[0])
+            rep(b"")
+        elif cmd == CMD_CONTROL:
+            if payload[0] == 1:
+                self.locked = bool(payload[1])
+            rep(b"")
+        elif cmd == CMD_READ_FILE:
+            rep(b"\x01demo")
+            rep(b"\x02")
+
+    def read(self, _timeout_ms):
+        return self.out.pop(0) if self.out else None
+
+    def close(self):
+        pass
+
+
+# --------------------------------------------------------------------------
 # helpers for the CLI
 
 def eng(value, unit, digits=3):
@@ -563,6 +708,35 @@ def stats(volts):
     mean = sum(volts) / n
     rms = (sum(v * v for v in volts) / n) ** 0.5
     return {"min": lo, "max": hi, "pkpk": hi - lo, "mean": mean, "rms": rms}
+
+
+def frequency(volts, dt):
+    """Frequency from rising crossings of the mid level (with hysteresis).
+    None if fewer than two full periods are visible."""
+    if not volts or not dt:
+        return None
+    lo, hi = min(volts), max(volts)
+    if hi - lo < 1e-9:
+        return None
+    mid = (hi + lo) / 2
+    hyst = (hi - lo) * 0.1
+    armed = False
+    crossings = []
+    for i, v in enumerate(volts):
+        if v < mid - hyst:
+            armed = True
+        elif armed and v > mid + hyst:
+            crossings.append(i)
+            armed = False
+    if len(crossings) < 3:
+        return None
+    period = (crossings[-1] - crossings[0]) / (len(crossings) - 1) * dt
+    return 1.0 / period if period > 0 else None
+
+
+def clipped(counts):
+    """True if the trace runs off the top or bottom of the ADC range."""
+    return bool(counts) and (min(counts) <= 1 or max(counts) >= 254)
 
 
 def stamp():
@@ -787,6 +961,8 @@ def main(argv=None):
         prog="dso5000p.py",
         description="Hantek DSO5072P/5102P/5202P per USB: Screenshots, Kurven als CSV, "
                     "Live-Ansicht, Messwert-Logger, Fernbedienung.")
+    p.add_argument("--demo", action="store_true",
+                   help="simuliertes Scope statt echtem Geraet (zum Ausprobieren)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def chan_arg(sp):
@@ -847,7 +1023,7 @@ def main(argv=None):
     dso = None
     try:
         if not getattr(args, "offline", False):
-            dso = DSO5000P()
+            dso = DSO5000P(SimTransport() if args.demo else None)
         args.func(dso, args)
     except ScopeError as e:
         print("Fehler: %s" % e, file=sys.stderr)

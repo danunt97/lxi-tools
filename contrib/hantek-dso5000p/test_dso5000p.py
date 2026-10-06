@@ -246,5 +246,49 @@ class Cli(unittest.TestCase):
         self.assertTrue(os.path.getsize(out) > 1000)
 
 
+class Sim(unittest.TestCase):
+    def test_demo_scope_reacts_to_keys(self):
+        dso = d.DSO5000P(d.SimTransport())
+        t, v = dso.waveform(1)
+        self.assertAlmostEqual(d.stats(v)["pkpk"], 3.0, delta=0.15)
+        self.assertAlmostEqual(d.frequency(v, t[1]), 1000, delta=5)
+        dso.press(d.find_key("ch1-volts-down"))
+        self.assertAlmostEqual(dso.settings().channel(1)["volts_div"], 0.5)
+        dso.press(d.find_key("runstop"))
+        self.assertFalse(dso.settings().running)
+        self.assertEqual(dso.samples(1), [])
+        self.assertEqual(len(dso.screenshot()), d.SCREEN_W * d.SCREEN_H * 3)
+
+    def test_frequency_needs_two_periods(self):
+        self.assertIsNone(d.frequency([0, 1, 0, 1], 1e-3))
+        self.assertIsNone(d.frequency([1.0] * 10, 1e-3))
+
+    def test_gui_worker(self):
+        try:
+            import dso5000p_gui as g
+        except ImportError:
+            self.skipTest("tkinter not available")
+        import queue
+        q = queue.Queue()
+        w = g.Worker(True, q)
+        w.start()
+        w.send("key", d.find_key("time-down"))
+        kinds, snaps = [], []
+        deadline = __import__("time").monotonic() + 5
+        while len(snaps) < 3 and __import__("time").monotonic() < deadline:
+            try:
+                m = q.get(timeout=1)
+            except queue.Empty:
+                continue
+            kinds.append(m[0])
+            if m[0] == "snap":
+                snaps.append(m)
+        w.stop()
+        w.join(3)
+        self.assertEqual(kinds[0], "connected")
+        self.assertEqual(snaps[-1][1].seconds_div, 100e-6)
+        self.assertEqual(sorted(snaps[-1][2]), [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

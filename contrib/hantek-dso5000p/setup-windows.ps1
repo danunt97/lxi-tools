@@ -90,11 +90,20 @@ Ok 'Pakete installiert'
 # 4. Verknuepfung ----------------------------------------------------------
 Step 'Desktop-Verknuepfung anlegen'
 $desktop = [Environment]::GetFolderPath('Desktop')
-$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\DSO5102P.lnk")
-$lnk.TargetPath = "$Dst\start-windows.bat"
+$Pyw = Join-Path (Split-Path $Py) 'pythonw.exe'
+if (-not (Test-Path -LiteralPath $Pyw)) { $Pyw = $Py }
+$shell = New-Object -ComObject WScript.Shell
+$lnk = $shell.CreateShortcut("$desktop\DSO5102P.lnk")
+$lnk.TargetPath = $Pyw
+$lnk.Arguments = '"' + "$Dst\dso5000p_gui.py" + '"'
 $lnk.WorkingDirectory = $Dst
 $lnk.Save()
-Ok "$desktop\DSO5102P.lnk"
+$lnk = $shell.CreateShortcut("$desktop\DSO5102P Demo.lnk")
+$lnk.TargetPath = $Pyw
+$lnk.Arguments = '"' + "$Dst\dso5000p_gui.py" + '" --demo'
+$lnk.WorkingDirectory = $Dst
+$lnk.Save()
+Ok "Desktop: 'DSO5102P' (Oberflaeche) und 'DSO5102P Demo' (ohne Scope)"
 
 # 5. Treiber + Test --------------------------------------------------------
 function Test-Scope {
@@ -134,6 +143,7 @@ Write-Host $r.text
 if ($r.ok) {
     Write-Host "`n=== Fertig! Das Scope ist verbunden. ===" -ForegroundColor Green
     Write-Host 'Ab jetzt einfach "DSO5102P" auf dem Desktop doppelklicken.'
+    Start-Process $Pyw -ArgumentList ('"' + "$Dst\dso5000p_gui.py" + '"') -WorkingDirectory $Dst
 } else {
     Write-Host "`n=== Installation fertig, aber das Scope antwortet noch nicht. ===" -ForegroundColor Yellow
     Write-Host 'Bitte einen Screenshot von diesem Fenster an Claude schicken.'

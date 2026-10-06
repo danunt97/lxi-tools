@@ -18,6 +18,26 @@ Was es kann:
 | `keys` | alle Tastennamen auflisten |
 | `lock on/off` | Bedienfeld am Scope sperren oder entsperren |
 | `getfile` | Datei vom internen Dateisystem des Scopes lesen |
+| `--demo …` | jeder Befehl mit simuliertem Scope, z. B. `--demo info` |
+
+## Grafische Oberfläche
+
+```sh
+python dso5000p_gui.py          # mit Scope
+python dso5000p_gui.py --demo   # simuliertes Scope, zum Ausprobieren
+```
+
+- **Live-Kurven**: der PC zeichnet beide Kanäle mit Raster (ca. 6–8 Bilder/s), darunter
+  Vpp, Min, Max, Mittelwert, RMS und Frequenz pro Kanal. Übersteuerung wird rot markiert.
+- **Scope-Bildschirm**: spiegelt das echte Display (ca. 1 Bild/s). Damit kannst du mit den
+  Menütasten **F0–F6** neben dem Bild durch die Menüs des Scopes navigieren.
+- Alle Tasten des Bedienfelds: Run/Stop, Single, Autoset, Menüs, Drehknopf, V/div,
+  Position, Zeit/div, Trigger-Pegel, 50 %, Force.
+- **Kurven als CSV** und **Screenshot speichern** oben rechts.
+- Tastatur: Leertaste = Run/Stop, A = Autoset, S = Single, ←/→ = Zeit/div, ↑/↓ = CH1 V/div.
+
+Unter Windows legt das Setup-Script dafür die Desktop-Verknüpfung **„DSO5102P“** an.
+Die Verknüpfung **„DSO5102P Demo“** startet die Oberfläche ohne Scope.
 
 ## Installation
 
