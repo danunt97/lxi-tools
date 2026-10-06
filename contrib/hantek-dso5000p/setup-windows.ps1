@@ -13,6 +13,9 @@ $Branch = 'claude/serene-archimedes-p3dv23'
 $ZipUrl = "https://github.com/danunt97/lxi-tools/archive/refs/heads/$Branch.zip"
 $ZadigUrl = 'https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe'
 $Dst = Join-Path $env:USERPROFILE 'DSO5102P'
+# Nicht $env:TEMP: bei Benutzernamen mit Leerzeichen ist das ein 8.3-Kurzpfad
+# (C:\Users\ABC~1\...), mit dem Remove-Item/Expand-Archive scheitern.
+$Work = Join-Path $env:LOCALAPPDATA 'dso5102p-setup'
 
 function Step($text) { Write-Host "`n==> $text" -ForegroundColor Cyan }
 function Ok($text)   { Write-Host "    $text" -ForegroundColor Green }
@@ -51,7 +54,8 @@ if (-not $Py) {
             --accept-package-agreements --accept-source-agreements `
             --override '/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1'
     } else {
-        $inst = Join-Path $env:TEMP 'python-setup.exe'
+        New-Item -ItemType Directory $Work -Force | Out-Null
+        $inst = Join-Path $Work 'python-setup.exe'
         Invoke-WebRequest 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' -OutFile $inst
         Start-Process $inst -ArgumentList '/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1' -Wait
     }
@@ -64,8 +68,8 @@ Ok "Python: $Py"
 
 # 2. Tool herunterladen ----------------------------------------------------
 Step "Tool herunterladen nach $Dst"
-$tmp = Join-Path $env:TEMP 'dso5102p-setup'
-Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+$tmp = $Work
+if (Test-Path -LiteralPath $tmp) { [System.IO.Directory]::Delete($tmp, $true) }
 New-Item -ItemType Directory $tmp | Out-Null
 Invoke-WebRequest $ZipUrl -OutFile "$tmp\tool.zip"
 Expand-Archive "$tmp\tool.zip" "$tmp\x"
