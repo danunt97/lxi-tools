@@ -38,7 +38,16 @@ Das Tool löst diesen Treiber automatisch. Ein separater Treiber ist unter Linux
 
 ### Windows
 
-**Kurzfassung:** `install-windows.bat` doppelklicken, Treiber mit Zadig umstellen (Schritt 3),
+**Am einfachsten, alles mit einem Befehl:** PowerShell öffnen (Windows-Taste, `PowerShell`, Enter) und einfügen:
+
+```powershell
+irm https://raw.githubusercontent.com/danunt97/lxi-tools/claude/serene-archimedes-p3dv23/contrib/hantek-dso5000p/setup-windows.ps1 | iex
+```
+
+Das installiert bei Bedarf Python, legt das Tool in `%USERPROFILE%\DSO5102P` ab, richtet eine
+Desktop-Verknüpfung ein, startet Zadig für den Treiber und testet die Verbindung.
+
+**Oder von Hand:** `install-windows.bat` doppelklicken, Treiber mit Zadig umstellen (Schritt 3),
 dann `start-windows.bat` doppelklicken. Es öffnet sich ein Menü mit allen Funktionen.
 Screenshots und CSV-Dateien landen im selben Ordner.
 
