@@ -43,8 +43,10 @@ der Akku **C-02** altert dabei sichtbar und löst Warnungen aus.
 
 ## Ablauf mit echter Hardware
 
-1. Adapter anschließen (3,3 V, Verdrahtung siehe Haupt-README), Akku aufstecken.
-2. **Auslesen** → Port wählen → **Verbinden** → **Akku auslesen** (dauert ca. 10–20 s).
+1. Adapter anschließen und den Akku aufstecken. Möglich sind zwei Varianten:
+   - 3,3-V-USB-Seriell-Adapter (Verdrahtung siehe Haupt-README)
+   - [ESP32-Brücke](../esp32-bridge/README.md) über USB oder WLAN
+2. **Auslesen** → Adapter und Port bzw. WLAN-Adresse wählen → **Verbinden** → **Akku auslesen** (dauert ca. 10–20 s).
 3. Bei einem neuen Akku Name, Standort und Kommentar eintragen und **Akku anlegen & Messung speichern** klicken.
    Bei einem bekannten Akku zeigt die Seite den Vergleich zur letzten Messung und mögliche
    Warnungen; gespeichert wird mit **Messung speichern**.

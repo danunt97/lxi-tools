@@ -78,6 +78,18 @@ python gui/m18_gui.py --demo   # simulated fleet, no hardware needed
 
 See [gui/README.md](gui/README.md) (German) for details.
 
+### ESP32 bridge
+
+Instead of a USB-serial adapter you can use an ESP32 ([esp32-bridge/](esp32-bridge/README.md)).
+It speaks the battery protocol itself and is reached over USB or Wi-Fi (`http://m18-bridge.local`).
+
+- `m18_bridge.py` exposes the ESP32 as an `M18` object.
+- In the GUI, choose "ESP32-Brücke" as the adapter.
+
+```bash
+python m18_bridge.py --bridge m18-bridge.local --health
+```
+
 ## Windows Users
 There are 4 .bat files for Windows users that are not familiar with the command line. Double-click on them to run them.
 * `m18_idle.bat` will prompt you to select a serial device, then bring the TX (J2) pin low. This is recommended before connecting to the battery to avoid increasing the counter for dumb-charges

@@ -85,11 +85,13 @@ def decode_registers(by_addr):
     cells = [round(c / 1000.0, 3) for c in cells_mv]
     imbalance = (max(cells_mv) - min(cells_mv)) if cells_mv else None
 
+    # Forge packs report 0x401F, others 0x4014; the unused one reads as 0.
     temp = None
     for addr in (0x401F, 0x4014):
         with contextlib.suppress(TypeError, ValueError):
-            if g(addr) not in (None, ""):
-                temp = round(float(g(addr)), 1)
+            v = float(g(addr))
+            if v != 0.0:
+                temp = round(v, 1)
                 break
 
     tool_time = 0
@@ -172,7 +174,14 @@ class Hardware:
                 if self.m is not None:
                     with contextlib.suppress(Exception):
                         self.m.port.close()
-                self.m = self.m18.M18(port)
+                import m18_bridge
+                if port.startswith("esp:") or m18_bridge.is_network_target(port):
+                    # ESP32 bridge on USB ("esp:COM7") or Wi-Fi ("m18-bridge.local")
+                    self.m = m18_bridge.M18Bridge(port[4:] if port.startswith("esp:") else port)
+                else:
+                    if self.m18.Serial is None:
+                        raise RuntimeError("pyserial fehlt – bitte 'pip install pyserial' ausführen")
+                    self.m = self.m18.M18(port)
                 self.port = port
                 ok = self.m.reset()
                 self.m.idle()

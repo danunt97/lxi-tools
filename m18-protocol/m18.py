@@ -5,8 +5,11 @@ import time
 from argparse import ArgumentParser
 from re import findall
 
-from serial import Serial
-from serial.tools import list_ports
+try:
+    from serial import Serial
+    from serial.tools import list_ports
+except ImportError:  # pyserial is only needed for a directly attached adapter
+    Serial = list_ports = None
 
 data_matrix = [
     [0x00, 0x00, 0x02],

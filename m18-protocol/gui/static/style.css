@@ -48,6 +48,7 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
 html { font-size: 14px; }
 body {
   background: var(--bg); color: var(--text); min-height: 100vh;

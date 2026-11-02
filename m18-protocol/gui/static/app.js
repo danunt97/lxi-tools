@@ -375,6 +375,11 @@ async function viewRead() {
       <h2>Verbindung</h2>
       <div class="conn">
         <span class="dot ${st.connected ? "on" : ""}" id="cdot"></span>
+        ${demo.demo ? "" : `<select id="kind" title="Wie ist der Akku angeschlossen?">
+          <option value="direct">USB-Seriell-Adapter</option>
+          <option value="esp">ESP32-Brücke (USB)</option>
+          <option value="wifi">ESP32-Brücke (WLAN)</option></select>
+          <input id="host" placeholder="m18-bridge.local oder IP" style="width:220px" hidden>`}
         <select id="port">${(ports.ports || []).map((p) => `<option value="${h(p.device)}" ${p.device === st.port ? "selected" : ""}>${h(p.device)}${p.desc ? " – " + h(p.desc) : ""}</option>`).join("") || '<option value="">(keine seriellen Ports gefunden)</option>'}</select>
         <button class="btn" id="rescan" title="Ports neu suchen">⟳</button>
         <button class="btn ${st.connected ? "" : "primary"}" id="connect">${st.connected ? "Trennen" : "Verbinden"}</button>
@@ -382,7 +387,7 @@ async function viewRead() {
         ${demo.demo ? `<span class="spacer" style="flex:1"></span><label class="check">Simulierter Akku am Adapter:
           <select id="plug">${demo.options.map((o) => `<option value="${o.key}" ${o.key === demo.plugged ? "selected" : ""}>${h(o.label)}</option>`).join("")}</select></label>` : ""}
       </div>
-      ${!demo.demo && !(ports.ports || []).length ? `<p class="hint" style="margin-top:10px">Kein Adapter gefunden. 3,3-V-USB-Seriell-Adapter anschließen (siehe README: Verdrahtung) und ⟳ drücken. Ist <span class="code">pyserial</span> installiert?</p>` : ""}
+      ${!demo.demo && !(ports.ports || []).length ? `<p class="hint" id="noports" style="margin-top:10px">Kein serieller Port gefunden. USB-Seriell-Adapter oder ESP32-Brücke anschließen und ⟳ drücken (ist <span class="code">pyserial</span> installiert?) – oder „ESP32-Brücke (WLAN)“ wählen.</p>` : ""}
     </div>
     <div class="card">
       <div class="readbox">
@@ -413,10 +418,34 @@ async function viewRead() {
     el.textContent = (d.lines || []).join("\n");
     el.scrollTop = el.scrollHeight;
   };
+  // Adapter type: direct USB-serial, ESP32 bridge via USB, ESP32 bridge via Wi-Fi
+  const kindPref = (() => { try { return JSON.parse(localStorage.getItem("m18.conn") || "{}"); } catch { return {}; } })();
+  const syncKind = () => {
+    if (!$("#kind")) return;
+    const wifi = $("#kind").value === "wifi";
+    $("#host").hidden = !wifi;
+    $("#port").hidden = wifi;
+    $("#rescan").hidden = wifi;
+    if ($("#noports")) $("#noports").hidden = wifi;
+  };
+  if ($("#kind")) {
+    const cur = st.port || "";
+    $("#kind").value = cur.startsWith("esp:") ? "esp" : /^(https?:\/\/|.*\.local$|\d+\.\d+\.\d+\.\d+)/.test(cur) ? "wifi" : (kindPref.kind || "direct");
+    $("#host").value = $("#kind").value === "wifi" && cur ? cur : (kindPref.host || "m18-bridge.local");
+    if (cur.startsWith("esp:")) $("#port").value = cur.slice(4);
+    $("#kind").onchange = syncKind;
+    syncKind();
+  }
+  const target = () => {
+    const kind = $("#kind") ? $("#kind").value : "direct";
+    try { localStorage.setItem("m18.conn", JSON.stringify({ kind, host: $("#host") ? $("#host").value : "" })); } catch { /* ignore */ }
+    if (kind === "wifi") return $("#host").value.trim();
+    return (kind === "esp" ? "esp:" : "") + $("#port").value;
+  };
   $("#rescan").onclick = () => viewRead();
   $("#connect").onclick = async () => {
     const on = $("#cdot").classList.contains("on");
-    const r = on ? await api("/api/disconnect", "POST") : await api("/api/connect", "POST", { port: $("#port").value });
+    const r = on ? await api("/api/disconnect", "POST") : await api("/api/connect", "POST", { port: target() });
     if (!on && !r.ok) toast("Verbinden fehlgeschlagen: " + (r.error || "?"), "err");
     else if (!on && r.ack === false) toast("Verbunden, aber keine Antwort vom Akku (kein ACK)", "err");
     setConn(!on && r.ok);
