@@ -262,8 +262,22 @@ class Reader {
     if (das >= 0 && bt) j.kvf("cycles", das / 3600.0f / bt->ah, 1);
     int health = (int)(max_(0.0f, 100.0f - total) + 0.5f);
     j.kvn("health", firstPart ? -1 : health);
-    j.kvs("status", firstPart ? "unknown" : health >= 80 ? "good" : health >= 60 ? "watch" : "weak", false);
-    j.raw("}");
+    j.kvs("status", firstPart ? "unknown" : health >= 80 ? "good" : health >= 60 ? "watch" : "weak");
+    // Raw register blocks (hex), so the PC can decode a stored reading with the same
+    // code as a live read-out (m18_bridge.registers_from_memory + decode_registers).
+    j.key("mem"); j.raw("{");
+    bool firstM = true;
+    for (int i = 0; i < NUM_BLOCKS; i++) {
+      const Block& b = BLOCKS[i];
+      if (!b.len || !mem_.has(b.addr, b.len)) continue;
+      char k[16];
+      snprintf(k, sizeof(k), "%s\"%04X\":\"", firstM ? "" : ",", b.addr);
+      firstM = false;
+      j.raw(k);
+      for (int x = 0; x < b.len; x++) { char hx[3]; snprintf(hx, sizeof(hx), "%02X", mem_.at(b.addr + x)); j.raw(hx); }
+      j.raw("\"");
+    }
+    j.raw("}}");
     return j.len();
   }
 

@@ -55,6 +55,25 @@ der Akku **C-02** altert dabei sichtbar und löst Warnungen aus.
 
 Tipp: Für vergleichbare Imbalance-Werte immer im gleichen Ladezustand messen, z. B. voll geladen.
 
+## Messungen von der ESP32-Brücke übernehmen
+
+Messungen, die direkt an der [ESP32-Brücke](../esp32-bridge/README.md) gemacht wurden (z. B. mit dem Handy beim Kunden),
+liegen zunächst nur auf der Brücke. So kommen sie in die Datenbank:
+
+- **Brücke erreichbar:** **Auslesen** → Brücke verbinden. Die Karte **„Auf der Brücke gespeichert“** erscheint;
+  dort auswählen und auf **Übernehmen** klicken.
+- **Brücke nicht erreichbar:** Auf der Brücke **Verlauf → „Alle als JSON exportieren“**, hier
+  **Einstellungen → „Messungen der ESP32-Brücke importieren“**.
+
+Was beim Übernehmen passiert:
+- Neue Akkus werden angelegt.
+- Standort und Kommentar aus der Messung werden übernommen.
+- Doppelte Messungen werden übersprungen.
+- Warnungen entstehen wie bei einer Messung am PC.
+- In der Messliste steht als Quelle `esp`.
+
+Ist die Brücke passwortgeschützt, fragt die GUI beim Verbinden danach und merkt es sich.
+
 ## Zustand und Warnungen
 
 Der Akku meldet keinen echten State-of-Health. Der **Zustand (0–100)** ist eine Schätzung:

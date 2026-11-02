@@ -381,7 +381,8 @@ async function viewRead() {
           <option value="wifi">ESP32-Brücke (WLAN)</option></select>
           <input id="host" placeholder="m18-bridge-xxxx.local oder IP" style="width:220px" hidden>
           <button class="btn" id="discover" hidden title="ESP32-Brücken im WLAN suchen">Suchen</button>
-          <select id="found" hidden></select>`}
+          <select id="found" hidden></select>
+          <input id="bpass" type="password" placeholder="Passwort der Brücke (falls gesetzt)" style="width:230px" hidden autocomplete="off">`}
         <select id="port">${(ports.ports || []).map((p) => `<option value="${h(p.device)}" data-esp="${p.esp ? 1 : ""}" ${p.device === st.port || "esp:" + p.device === st.port ? "selected" : ""}>${h(p.device)}${p.esp ? " – ESP32-S3 (M18-Brücke)" : p.desc ? " – " + h(p.desc) : ""}</option>`).join("") || '<option value="">(keine seriellen Ports gefunden)</option>'}</select>
         <button class="btn" id="rescan" title="Ports neu suchen">⟳</button>
         <button class="btn ${st.connected ? "" : "primary"}" id="connect">${st.connected ? "Trennen" : "Verbinden"}</button>
@@ -397,6 +398,7 @@ async function viewRead() {
         <span class="hint" id="readhint">${st.connected ? "Das Auslesen dauert ca. 10–20 Sekunden." : "Zuerst verbinden."}</span>
       </div>
     </div>
+    <div id="bridgehist" style="margin-top:16px"></div>
     <div id="readresult" style="margin-top:16px"></div>
     <div class="grid g2" style="margin-top:16px">
       <details class="card"><summary>Protokoll</summary><pre class="log" id="log"></pre></details>
@@ -429,6 +431,7 @@ async function viewRead() {
     $("#port").hidden = wifi;
     $("#rescan").hidden = wifi;
     $("#discover").hidden = !wifi;
+    $("#bpass").hidden = !wifi;
     if (!wifi) $("#found").hidden = true;
     if ($("#noports")) $("#noports").hidden = wifi;
     if (wifi && !st.connected && !searched) discover();
@@ -443,7 +446,7 @@ async function viewRead() {
     const list = d.bridges || [];
     const sel = $("#found");
     if (!list.length) { sel.hidden = true; toast("Keine ESP32-Brücke im WLAN gefunden", "err"); return; }
-    sel.innerHTML = list.map((x) => `<option value="${h(x.ip)}">${h(x.host || x.ip)} · ${h(x.ip)} · v${h(x.version)}</option>`).join("");
+    sel.innerHTML = list.map((x) => `<option value="${h(x.ip)}">${x.auth === "1" ? "🔒 " : ""}${h(x.host || x.ip)} · ${h(x.ip)} · v${h(x.version)}${+x.unsynced ? ` · ${h(x.unsynced)} neue Messungen` : ""}</option>`).join("");
     sel.hidden = list.length < 2;
     if (!list.some((x) => x.ip === $("#host").value || x.host === $("#host").value)) $("#host").value = list[0].ip;
     toast(list.length === 1 ? `Brücke gefunden: ${list[0].host || list[0].ip}` : `${list.length} Brücken gefunden`);
@@ -470,10 +473,15 @@ async function viewRead() {
   $("#rescan").onclick = () => viewRead();
   $("#connect").onclick = async () => {
     const on = $("#cdot").classList.contains("on");
-    const r = on ? await api("/api/disconnect", "POST") : await api("/api/connect", "POST", { port: target() });
-    if (!on && !r.ok) toast("Verbinden fehlgeschlagen: " + (r.error || "?"), "err");
-    else if (!on && r.ack === false) toast("Verbunden, aber keine Antwort vom Akku (kein ACK)", "err");
+    const r = on ? await api("/api/disconnect", "POST")
+      : await api("/api/connect", "POST", { port: target(), password: $("#bpass") ? $("#bpass").value : "" });
+    if (!on && !r.ok) {
+      toast("Verbinden fehlgeschlagen: " + (r.error || "?"), "err");
+      if (r.auth && $("#bpass")) { $("#bpass").hidden = false; $("#bpass").focus(); }
+    } else if (!on && r.ack === false) toast("Verbunden, aber keine Antwort vom Akku (kein ACK) – Messungen auf der Brücke lassen sich trotzdem übernehmen", "err");
     setConn(!on && r.ok);
+    if (!on && r.ok && r.bridge) loadBridgeHistory();
+    if (on) $("#bridgehist").innerHTML = "";
     refreshLog();
   };
   $("#idle").onclick = async () => { await api("/api/idle", "POST"); refreshLog(); };
@@ -496,8 +504,60 @@ async function viewRead() {
     }
   };
   if (lastRead) renderReadResult(lastRead, lastRead._saved);
+  if (st.connected && st.bridge) loadBridgeHistory();
   refreshLog();
   readTimer = setInterval(refreshLog, 4000);
+}
+
+/* Measurements stored on the ESP32 bridge (offline read-outs) -> import into the database */
+async function loadBridgeHistory() {
+  const box = $("#bridgehist");
+  if (!box) return;
+  const d = await api("/api/bridge/history");
+  if (!d.available) { box.innerHTML = ""; return; }
+  if (!d.ok) { box.innerHTML = `<div class="card"><h2>Auf der Brücke gespeichert</h2><p class="hint">${h(d.error)}</p></div>`; return; }
+  const items = d.items || [];
+  const st = d.stats || {};
+  if (!items.length) {
+    box.innerHTML = `<div class="card"><h2>Auf der Brücke gespeichert <span class="right faint">${num(st.count)} Messungen, alle übernommen</span></h2>
+      <p class="hint">Keine neuen Messungen auf der Brücke.</p></div>`;
+    return;
+  }
+  const when = (m) => m.ts ? fmtDateTime(new Date(m.ts * 1000).toISOString()) : '<span class="faint">Zeit wird beim Import ermittelt</span>';
+  box.innerHTML = `<div class="card"><h2>Auf der Brücke gespeichert <span class="right">${items.length} neue Messung${items.length > 1 ? "en" : ""}</span></h2>
+    <p class="hint" style="margin-bottom:10px">Diese Messungen wurden direkt an der Brücke (z. B. mit dem Handy) gemacht und sind noch nicht in der Datenbank.</p>
+    <div class="table-wrap"><table class="list"><thead><tr><th><input type="checkbox" id="bh-all" checked></th><th>Zeitpunkt</th><th>Akku</th>
+      <th>Modell</th><th class="num">Zustand</th><th>Standort</th><th>Kommentar</th><th></th></tr></thead><tbody>
+      ${items.map((m) => `<tr><td><input type="checkbox" class="bh" value="${m.id}" checked></td><td>${when(m)}</td>
+        <td class="name-cell"><b>${h(m.note || m.eserial || "?")}</b><span>${h(m.eserial || "")}</span></td><td class="nw">${h(m.model || "–")}</td>
+        <td class="num c-${healthClass(m.health)}">${num(m.health)}</td><td>${h(m.loc || "–")}</td><td>${h(m.comment || "")}</td>
+        <td class="faint">#${m.id}</td></tr>`).join("")}</tbody></table></div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap"><button class="btn primary" id="bh-import">Ausgewählte übernehmen</button></div>
+    <div id="bh-result"></div></div>`;
+  $("#bh-all").onchange = (e) => $$(".bh").forEach((c) => { c.checked = e.target.checked; });
+  $("#bh-import").onclick = async () => {
+    const ids = $$(".bh").filter((c) => c.checked).map((c) => +c.value);
+    if (!ids.length) { toast("Nichts ausgewählt", "err"); return; }
+    const btn = $("#bh-import");
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Übernehme …';
+    const r = await api("/api/bridge/import", "POST", { ids });
+    btn.disabled = false; btn.textContent = "Ausgewählte übernehmen";
+    if (!r.ok) { toast(r.error || "Fehler", "err"); return; }
+    showImportResult(r, $("#bh-result"));
+    refreshAlertCount();
+    setTimeout(loadBridgeHistory, 4000);
+  };
+}
+
+function showImportResult(r, el) {
+  const alerts = (r.items || []).flatMap((i) => (i.alerts || []).map((a) => ({ ...a, who: i.name || i.eserial })));
+  el.innerHTML = `<div class="callout ${r.errors.length ? "warn" : "known"}" style="margin-top:12px">
+    <h3>✓ ${r.imported} Messung${r.imported === 1 ? "" : "en"} übernommen</h3>
+    <div>${r.created === 1 ? "1 neuer Akku" : r.created + " neue Akkus"} angelegt · ${r.duplicates === 1 ? "1 war" : r.duplicates + " waren"} schon in der Datenbank (gleiche Werte)</div>
+    ${alerts.length ? `<div style="margin-top:6px">${alerts.map((a) => `<div><span class="sev ${a.severity}">${SEVERITY[a.severity]}</span> ${h(a.who)}: ${h(a.message)}</div>`).join("")}</div>` : ""}
+    ${r.errors.length ? `<div style="margin-top:6px">${r.errors.map((e) => `<div class="c-crit">${h(e)}</div>`).join("")}</div>` : ""}
+    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">${[...new Map((r.items || []).filter((i) => i.status === "imported")
+      .map((i) => [i.eserial, i])).values()].map((i) => `<a class="btn small" href="/b/${encodeURIComponent(i.eserial)}" data-link>${h(i.name || i.eserial)} →</a>`).join("")}</div></div>`;
 }
 
 function cmpRow(label, prev, cur, unit = "", nf = NF0, higherIsBetter = null) {
@@ -642,6 +702,12 @@ async function viewSettings() {
             <a class="btn" href="/export/fleet.csv">${ICON.dl} Flotte als CSV (Excel)</a>
             <a class="btn" href="/export/fleet.csv?format=intl">${ICON.dl} CSV (international)</a>
           </div></div>
+        <div class="card"><h2>Messungen der ESP32-Brücke importieren</h2>
+          <p class="hint" style="margin-bottom:10px">Export-Datei aus der Weboberfläche der Brücke (Verlauf → „Alle als JSON exportieren“).
+            Bereits vorhandene Messungen werden erkannt und übersprungen. Ist die Brücke erreichbar, geht es direkter über
+            <a href="/read" data-link>Auslesen</a> → Brücke verbinden → „Übernehmen“.</p>
+          <input type="file" id="bfile" accept=".json,application/json"> <button class="btn" id="bfilebtn">Importieren</button>
+          <div id="bfileres"></div></div>
       </div>
       <div class="card"><h2>Bewertung &amp; Warnschwellen</h2>
         <div class="kv">
@@ -665,6 +731,16 @@ async function viewSettings() {
           Die Schwellen stehen in <span class="code">gui/fleet.py</span>.</div>
       </div>
     </div>`;
+  $("#bfilebtn").onclick = async () => {
+    const f = $("#bfile").files[0];
+    if (!f) { toast("Bitte zuerst die Datei wählen", "err"); return; }
+    let data;
+    try { data = JSON.parse(await f.text()); } catch { toast("Keine gültige JSON-Datei", "err"); return; }
+    const r = await api("/api/import/bridge-file", "POST", data);
+    if (!r.ok) { toast(r.error || "Fehler", "err"); return; }
+    showImportResult(r, $("#bfileres"));
+    refreshAlertCount();
+  };
   if ($("#usesugg")) $("#usesugg").onclick = (e) => { e.preventDefault(); $("#sform [name=base_url]").value = s.suggested_base_url; };
   $("#sform").onsubmit = async (e) => {
     e.preventDefault();

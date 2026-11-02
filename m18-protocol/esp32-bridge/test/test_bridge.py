@@ -41,9 +41,10 @@ def build_sim():
 class SimProcess:
     """sim_bridge serve: bridge line protocol on stdin/stdout."""
 
-    def __init__(self, exe):
-        self.p = subprocess.Popen([exe, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  text=True, bufsize=1)
+    def __init__(self, exe, hist_dir=None):
+        self.hist_dir = hist_dir or tempfile.mkdtemp(prefix="m18hist")
+        self.p = subprocess.Popen([exe, "serve", self.hist_dir], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  text=True, bufsize=1, encoding="utf-8")
         self.p.stdout.readline()  # READY banner
         self.lock = threading.Lock()
 
@@ -86,7 +87,7 @@ class TestBridge(unittest.TestCase):
         self.assertEqual(sc["imbalance_mv"], snap["imbalance_mv"])
         for k in ("total_charges", "overheat", "lowvolt", "discharge_as", "days", "tool_time_s"):
             self.assertEqual(sc["counters"][k], snap["counters"][k], k)
-        now = fleet.parse_ts(sc["battery_date"])          # bridge has no NTP here -> battery clock
+        now = fleet.utcnow()                              # M18Bridge set the bridge clock (TIME) on connect
         health, parts = fleet.health_estimate(snap, None, now)
         self.assertEqual(sc["health"], health)
         self.assertEqual([p["label"] for p in sc["health_parts"]], [p["label"] for p in parts])

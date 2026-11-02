@@ -10,10 +10,14 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "m18_commands.h"
 
@@ -100,10 +104,44 @@ class SimBattery : public m18::Port {
   void reply(std::vector<uint8_t> v) { for (uint8_t b : v) rx.push_back(rev8(b)); }
 };
 
-static std::string run(m18::CommandProcessor& p, const char* line) {
-  static char buf[2048];
-  p.handle(line, buf, sizeof(buf));
-  return buf;
+static std::string run(m18::CommandProcessor& p, const char* line) { return p.handle(line); }
+
+// History storage on the PC: plain files (the ESP uses FFat/LittleFS with the same interface).
+namespace fs = std::filesystem;
+class HostStorage : public m18::Storage {
+ public:
+  explicit HostStorage(const std::string& root) : root_(root) { fs::create_directories(root_); }
+  uint64_t fakeFree = 0;                      // != 0: pretend the flash is this full
+  bool ok() override { return true; }
+  bool mkdir(const std::string& d) override { fs::create_directories(root_ + d); return true; }
+  void list(const std::string& d, std::vector<std::string>& names) override {
+    for (auto& e : fs::directory_iterator(root_ + d)) names.push_back(e.path().filename().string());
+  }
+  bool read(const std::string& p, std::string& out, bool firstLine) override {
+    std::ifstream f(root_ + p, std::ios::binary);
+    if (!f) return false;
+    if (firstLine) { std::getline(f, out); return true; }
+    std::stringstream ss; ss << f.rdbuf(); out = ss.str(); return true;
+  }
+  bool write(const std::string& p, const std::string& data) override {
+    std::string tmp = root_ + p + ".tmp";
+    { std::ofstream f(tmp, std::ios::binary); if (!f) return false; f << data; }
+    std::error_code ec; fs::rename(tmp, root_ + p, ec); return !ec;
+  }
+  bool remove(const std::string& p) override { std::error_code ec; return fs::remove(root_ + p, ec); }
+  bool rename(const std::string& a, const std::string& b) override { std::error_code ec; fs::rename(root_ + a, root_ + b, ec); return !ec; }
+  uint64_t freeBytes() override { return fakeFree ? fakeFree : fs::space(root_).available; }
+  uint64_t totalBytes() override { return fs::space(root_).capacity; }
+ private:
+  std::string root_;
+};
+
+static uint32_t simNow = 0;                   // 0 = clock not set (like an ESP without NTP)
+static uint32_t simClock() { return simNow; }
+static bool simSetTime(uint32_t t) { if (simNow) return false; simNow = t; return true; }
+static std::string simLoc = "Kunde Meier", simComment = "Testmessung";
+static void simMeta(m18::RecordMeta& m) {
+  m.ts = simNow; m.tsSrc = simNow ? "pc" : "none"; m.boot = 4242; m.upMs = 123456; m.loc = simLoc; m.comment = simComment;
 }
 
 static int failures = 0;
@@ -180,6 +218,63 @@ int selftest() {
     std::string sc = run(p4, "SCAN");
     expect(sc.find("Zellspannungen unplausibel") != std::string::npos ? "plausibility" : sc.substr(0, 80), "plausibility");
   }
+  expect(scan.find("\"mem\":{\"0000\":\"0005\",\"0002\"") != std::string::npos ? "raw blocks" : "no raw blocks", "raw blocks");
+  expect(scan.find("\"400A\":\"0FAC0FAA0FAF0FA90FAB\"") != std::string::npos ? "raw cells" : "no raw cells", "raw cells");
+
+  {  // history: SCAN stores, list/get/ack/delete, time, rotation
+    std::string dir = (fs::temp_directory_path() / ("m18hist_" + std::to_string(::getpid()))).string();
+    fs::remove_all(dir);
+    HostStorage st(dir);
+    m18::History hist(st);
+    expect(hist.begin() ? "hist ready" : "hist fail", "hist ready");
+    p.setHistory(&hist);
+    p.setClock(simClock);
+    p.setTimeSetter(simSetTime);
+    p.setMetaProvider(simMeta);
+    expect(run(p, "HSTAT"), "OK {\"count\":0,\"unsynced\":0", true);
+    expect(run(p, "TIME 1762000000"), "OK 1762000000");
+    expect(run(p, "TIME 1800000000"), "OK 1762000000");              // already set: unchanged
+    std::string sc = run(p, "SCAN");
+    expect(sc.find("\"history_id\":1}") != std::string::npos ? "stored id 1" : sc.substr(sc.size() - 40), "stored id 1");
+    run(p, "SCAN");
+    run(p, "SCAN");
+    std::string l = run(p, "HLIST 0 2 new");
+    expect(l, "OK {\"items\":[{\"synced\":false,\"id\":1,\"ts\":1762000000,\"ts_src\":\"pc\",\"boot\":4242,", true);
+    expect(l.find("\"next\":2,\"count\":3,\"unsynced\":3") != std::string::npos ? "paging" : l.substr(l.size() - 120), "paging");
+    expect(l.find("\"loc\":\"Kunde Meier\"") != std::string::npos ? "loc" : "no loc", "loc");
+    std::string g = run(p, "HGET 2");
+    expect(g, "OK {\"meta\":{\"synced\":false,\"id\":2", true);
+    expect(g.find("\"scan\":{\"ok\":true") != std::string::npos && g.back() == '}' ? "get scan" : "bad get", "get scan");
+    expect(run(p, "HACK 1"), "OK");
+    expect(run(p, "HACK 99"), "ERR NOTFOUND");
+    expect(run(p, "HLIST 0 50 new").find("\"id\":1,") == std::string::npos ? "acked hidden" : "acked shown", "acked hidden");
+    expect(run(p, "HSTAT"), "OK {\"count\":3,\"unsynced\":2", true);
+    // persistence: a fresh History on the same directory sees the same records
+    m18::History again(st);
+    again.begin();
+    expect(again.count() == 3 && again.unsynced() == 2 ? "persisted" : "lost", "persisted");
+    expect(run(p, "HDEL 3"), "OK");
+    expect(run(p, "HCLEAR"), "OK 1");                                  // synced only -> record 1
+    expect(run(p, "HSTAT"), "OK {\"count\":1,\"unsynced\":1", true);
+    // rotation: limit 3 records, oldest imported ones go first
+    hist.maxRecords = 3;
+    run(p, "SCAN"); run(p, "SCAN");                                       // ids 4,5 -> 3 records (2,4,5)
+    run(p, "HACK 4");
+    run(p, "SCAN");                                                       // id 6 -> drops 4 (imported)
+    std::string all = run(p, "HLIST 0 50 all");
+    expect(all.find("\"id\":4,") == std::string::npos && all.find("\"id\":2,") != std::string::npos
+           ? "rotation keeps unsynced" : all.substr(0, 200), "rotation keeps unsynced");
+    // failed read-outs are not stored
+    bat.present = false;
+    run(p, "SCAN");
+    expect(run(p, "HSTAT"), "OK {\"count\":3", true);
+    bat.present = true;
+    expect(run(p, "HGET abc"), "ERR ARGS");
+    p.setHistory(nullptr);
+    expect(run(p, "HSTAT"), "ERR NOSTORAGE", true);
+    fs::remove_all(dir);
+  }
+
   bat.present = false;                                                   // battery unplugged
   expect(run(p, "SCAN"), "ERR {\"ok\":false,\"blocks_ok\":0", true);
   expect(run(p, "RESET"), "ERR NOACK");
@@ -188,11 +283,19 @@ int selftest() {
   return failures ? 1 : 0;
 }
 
-int serve() {
+int serve(const char* histDir) {
   SimBattery bat;
   m18::Link link(bat);
   m18::Reader reader(link, bat);
   m18::CommandProcessor p(link, reader);
+  HostStorage st(histDir);
+  m18::History hist(st);
+  hist.begin();
+  p.setHistory(&hist);
+  p.setClock(simClock);
+  p.setTimeSetter(simSetTime);
+  p.setMetaProvider(simMeta);
+  p.setInfoExtra("\"boot\":4242,\"uptime_s\":200");
   std::printf("M18BRIDGE READY %s wifi=off ip=\n", M18BRIDGE_VERSION);
   std::fflush(stdout);
   std::string line;
@@ -206,6 +309,9 @@ int serve() {
 }
 
 int main(int argc, char** argv) {
-  if (argc > 1 && !std::strcmp(argv[1], "serve")) return serve();
+  if (argc > 1 && !std::strcmp(argv[1], "serve")) {
+    std::string dir = argc > 2 ? argv[2] : (fs::temp_directory_path() / ("m18serve_" + std::to_string(::getpid()))).string();
+    return serve(dir.c_str());
+  }
   return selftest();
 }

@@ -24,7 +24,6 @@ import datetime as _dt
 import io
 import json
 import os
-import re
 import secrets
 import socket
 import sys
@@ -47,97 +46,7 @@ from qrgen import QrCode  # noqa: E402
 DEFAULT_DB = os.path.join(PARENT, "data", "m18_fleet.db")
 
 
-# --------------------------------------------------------------------------
-# Register decoding (live mode)
-# --------------------------------------------------------------------------
-def _date(v):
-    """datetime from m18.py -> ISO string, ignoring unset (epoch-ish) dates."""
-    if isinstance(v, _dt.datetime):
-        if v.year < 2005:
-            return None
-        return iso(v if v.tzinfo else v.replace(tzinfo=_dt.timezone.utc))
-    return None
-
-
-def _int(v):
-    return v if isinstance(v, int) else None
-
-
-def _hhmmss(v):
-    if not isinstance(v, str) or ":" not in v:
-        return None
-    try:
-        h, m, s = (int(x) for x in v.split(":"))
-        return h * 3600 + m * 60 + s
-    except ValueError:
-        return None
-
-
-def decode_registers(by_addr):
-    """Turn {address: value} from M18.read_id(output='array') into a snapshot."""
-    g = by_addr.get
-    sn = str(g(0x0004) or "")
-    nums = re.findall(r"\d+", sn)
-    type_code = int(nums[0]) if len(nums) >= 1 else None
-    serial_num = int(nums[1]) if len(nums) >= 2 else None
-    eserial = f"{type_code}-{serial_num}" if serial_num is not None else None
-
-    cells_mv = [c for c in (g(0x400A) or []) if isinstance(c, int)]
-    cells = [round(c / 1000.0, 3) for c in cells_mv]
-    imbalance = (max(cells_mv) - min(cells_mv)) if cells_mv else None
-
-    # Forge packs report 0x401F, others 0x4014; the unused one reads as 0.
-    temp = None
-    for addr in (0x401F, 0x4014):
-        with contextlib.suppress(TypeError, ValueError):
-            v = float(g(addr))
-            if v != 0.0:
-                temp = round(v, 1)
-                break
-
-    tool_time = 0
-    have_hist = False
-    for addr in range(0x903A, 0x9062, 2):  # discharge histogram 10A .. 200A+
-        if isinstance(g(addr), int):
-            tool_time += g(addr)
-            have_hist = True
-
-    note = str(g(0x0023) or "").strip('"').rstrip("-").strip()
-    return {
-        "ok": eserial is not None,
-        "eserial": eserial,
-        "type_code": type_code,
-        "serial_num": serial_num,
-        "serial": sn,
-        "cell_type": _int(g(0x0000)),
-        "manufactured": _date(g(0x0011)),
-        "first_charge": _date(g(0x0015)) or _date(g(0x9000)),
-        "last_charge": _date(g(0x0019)) or _date(g(0x9008)),
-        "last_tool_use": _date(g(0x9004)),
-        "note": note,
-        "cells": cells,
-        "pack_v": round(sum(cells), 2) if cells else None,
-        "temp": temp,
-        "imbalance_mv": imbalance,
-        "counters": {
-            "total_charges": _int(g(0x901A)),
-            "redlink_charges": _int(g(0x9020)),
-            "dumb_charges": _int(g(0x901E)),
-            "discharge_as": _int(g(0x9012)),
-            "discharge_ws": _int(g(0x9016)),
-            "overheat": _int(g(0x9032)),
-            "overcurrent": _int(g(0x9034)),
-            "lowvolt": _int(g(0x9036)),
-            "lowvolt_bounce": _int(g(0x9038)),
-            "discharge_to_empty": _int(g(0x9030)),
-            "lowv_charges": _int(g(0x902E)),
-            "days": _int(g(0x9010)),
-            "charge_time_s": _hhmmss(g(0x9024)),
-            "tool_time_s": tool_time if have_hist else None,
-        },
-        "raw": {f"0x{a:04X}": (_date(v) if isinstance(v, _dt.datetime) else v)
-                for a, v in by_addr.items()},
-    }
+from registers import decode_registers  # noqa: E402,F401  (re-exported for tests)
 
 
 # --------------------------------------------------------------------------
@@ -165,7 +74,7 @@ class Hardware:
                  "esp": m18_bridge.is_bridge_usb_port(p)}
                 for p in list_ports.comports()]
 
-    def connect(self, port):
+    def connect(self, port, password=None):
         if not port:
             return {"ok": False, "error": "Kein Port gewählt"}
         with self.lock:
@@ -180,7 +89,8 @@ class Hardware:
                 import m18_bridge
                 if port.startswith("esp:") or m18_bridge.is_network_target(port):
                     # ESP32 bridge on USB ("esp:COM7") or Wi-Fi ("m18-bridge.local")
-                    self.m = m18_bridge.M18Bridge(port[4:] if port.startswith("esp:") else port)
+                    self.m = m18_bridge.M18Bridge(port[4:] if port.startswith("esp:") else port,
+                                                  password=password or None)
                 else:
                     if self.m18.Serial is None:
                         raise RuntimeError("pyserial fehlt – bitte 'pip install pyserial' ausführen")
@@ -189,12 +99,42 @@ class Hardware:
                 ok = self.m.reset()
                 self.m.idle()
                 self.log(f"Verbunden mit {port} – Reset {'ACK' if ok else 'ohne ACK'}")
-                return {"ok": True, "ack": bool(ok)}
+                return {"ok": True, "ack": bool(ok), "bridge": self.is_bridge()}
             except Exception as e:
                 self.m = None
                 self.port = None
                 self.log(f"Verbinden fehlgeschlagen: {e}")
+                import m18_bridge
+                return {"ok": False, "error": str(e), "auth": isinstance(e, m18_bridge.BridgeAuthError)}
+
+    def is_bridge(self):
+        import m18_bridge
+        return isinstance(self.m, m18_bridge.M18Bridge)
+
+    # -- measurements stored on the ESP32 bridge ---------------------------
+    def bridge_history(self):
+        if not self.is_bridge():
+            return {"available": False}
+        with self.lock:
+            try:
+                stats = self.m.history_stats()
+                items = self.m.history_list(new_only=True)
+            except Exception as e:
+                return {"available": True, "ok": False, "error": str(e)}
+        return {"available": True, "ok": True, "stats": stats, "items": items}
+
+    def bridge_import(self, db, ids=None):
+        if not self.is_bridge():
+            return {"ok": False, "error": "Keine ESP32-Brücke verbunden"}
+        from bridge_import import import_from_bridge
+        with self.lock:
+            try:
+                res = import_from_bridge(db, self.m, ids)
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
+        self.log(f"Von der Brücke übernommen: {res['imported']} Messungen, {res['created']} neue Akkus, "
+                 f"{res['duplicates']} schon vorhanden")
+        return {"ok": True, **res}
 
     def disconnect(self):
         with self.lock:
@@ -278,19 +218,26 @@ class App:
         if self.demo:
             return {"connected": self.demo_connected, "port": "DEMO" if self.demo_connected else None,
                     "demo": True, "plugged": self.demo.plugged}
-        return {"connected": self.hw.port is not None, "port": self.hw.port, "demo": False}
+        return {"connected": self.hw.port is not None, "port": self.hw.port, "demo": False,
+                "bridge": self.hw.is_bridge()}
 
     def ports(self):
         if self.demo:
             return [{"device": "DEMO", "desc": "Demo-Adapter (simuliert)"}]
         return self.hw.list_ports()
 
-    def connect(self, port):
+    def connect(self, port, password=None):
         if self.demo:
             self.demo_connected = True
             self.log("Verbunden (Demo)")
             return {"ok": True}
-        return self.hw.connect(port)
+        # remember the bridge password locally (this database lives on the user's PC)
+        if password:
+            self.db.set_setting("bridge_password", password)
+        res = self.hw.connect(port, password or self.db.get_setting("bridge_password") or None)
+        if res.get("auth"):
+            res["error"] = "Die Brücke ist passwortgeschützt – bitte Passwort eingeben"
+        return res
 
     def disconnect(self):
         if self.demo:
@@ -603,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
             if r == ["resolve"]:
                 b = db.resolve(qs.get("q", [""])[0])
                 return self._send(200, {"battery": b})
+            if r == ["bridge", "history"]:
+                return self._send(200, app.hw.bridge_history() if app.hw else {"available": False})
             if r == ["discover"]:
                 if app.demo:
                     return self._send(200, {"bridges": []})
@@ -625,7 +574,20 @@ class Handler(BaseHTTPRequestHandler):
         data = self._json_body()
         try:
             if r == ["connect"]:
-                return self._send(200, app.connect(data.get("port")))
+                return self._send(200, app.connect(data.get("port"), data.get("password")))
+            if r == ["bridge", "import"]:
+                ids = data.get("ids")
+                return self._send(200, app.hw.bridge_import(db, ids) if app.hw else
+                                  {"ok": False, "error": "Im Demo-Modus nicht verfügbar"})
+            if r == ["import", "bridge-file"]:
+                from bridge_import import import_records
+                recs = data.get("records")
+                if data.get("format") != "m18-bridge-export" or not isinstance(recs, list):
+                    return self._send(400, {"ok": False, "error": "Keine Export-Datei der M18-Brücke"})
+                res = import_records(db, recs)
+                app.log(f"Datei-Import: {res['imported']} Messungen, {res['created']} neue Akkus, "
+                        f"{res['duplicates']} schon vorhanden")
+                return self._send(200, {"ok": True, **res})
             if r == ["disconnect"]:
                 return self._send(200, app.disconnect())
             if r == ["idle"]:

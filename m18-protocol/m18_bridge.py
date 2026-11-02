@@ -18,10 +18,13 @@ In Python:
     m.health()
 """
 
+import base64
+import datetime
 import json
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import m18
@@ -29,6 +32,10 @@ import m18
 
 class BridgeError(Exception):
     pass
+
+
+class BridgeAuthError(BridgeError):
+    """Password missing or wrong (HTTP 401) - never retried."""
 
 
 def is_network_target(target):
@@ -56,6 +63,8 @@ class _LinkBase:
         while True:
             try:
                 out = self._exec(lines, timeout)
+            except BridgeAuthError:
+                raise
             except BridgeError:
                 attempt += 1
                 if attempt > self.retries:
@@ -156,24 +165,40 @@ class SerialLink(_LinkBase):
 class HttpLink(_LinkBase):
     """ESP32 on the network: POST /cmd with one command per line."""
 
-    def __init__(self, target, timeout=10.0):
+    def __init__(self, target, timeout=10.0, password=None):
         t = target.strip().rstrip("/")
         if not t.startswith(("http://", "https://")):
             t = "http://" + t
+        # credentials may be part of the URL: http://m18:secret@host
+        parts = urllib.parse.urlsplit(t)
+        if parts.password is not None and not password:
+            password = urllib.parse.unquote(parts.password)
+        if parts.username is not None or parts.password is not None:
+            host = parts.hostname + (f":{parts.port}" if parts.port else "")
+            t = urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
         self.base = t
         self.device = t
         self.timeout = timeout
+        self.auth = None
+        if password:
+            self.auth = "Basic " + base64.b64encode(f"m18:{password}".encode()).decode()
         r = self.exec(["PING"])[0]
         if not r.startswith("OK M18BRIDGE"):
             raise BridgeError(f"{t} ist keine M18-Brücke (Antwort: {r!r})")
 
     def _exec(self, lines, timeout=None):
         body = ("\n".join(lines) + "\n").encode("utf-8")
-        req = urllib.request.Request(self.base + "/cmd", data=body, method="POST",
-                                     headers={"Content-Type": "text/plain"})
+        headers = {"Content-Type": "text/plain"}
+        if self.auth:
+            headers["Authorization"] = self.auth
+        req = urllib.request.Request(self.base + "/cmd", data=body, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 out = resp.read().decode("utf-8", "replace").splitlines()
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise BridgeAuthError("Die Brücke ist passwortgeschützt – Passwort fehlt oder ist falsch") from e
+            raise BridgeError(f"M18-Brücke {self.base}: HTTP {e.code}") from e
         except (urllib.error.URLError, OSError) as e:
             raise BridgeError(f"M18-Brücke {self.base} nicht erreichbar: {e}") from e
         out = [o.strip() for o in out if o.strip()]
@@ -257,18 +282,64 @@ def is_bridge_usb_port(p):
     return getattr(p, "vid", None) == ESPRESSIF_USB_VID
 
 
-def open_link(target):
-    return HttpLink(target) if is_network_target(target) else SerialLink(target)
+def open_link(target, password=None):
+    if is_network_target(target):
+        return HttpLink(target, password=password)
+    return SerialLink(target)
+
+
+def registers_from_memory(mem):
+    """Raw register blocks stored by the bridge ({"0000": "0005", "400A": "0FAC..."})
+    -> {address: value} exactly like m18.M18.read_id(output="array") returns them,
+    so readings taken offline decode through the same code as live ones."""
+    byte = {}
+    for start, hexdata in (mem or {}).items():
+        a = int(start, 16)
+        for i, b in enumerate(bytes.fromhex(hexdata)):
+            byte[a + i] = b
+    out = {}
+    for addr, length, dtype, _label in m18.data_id:
+        if not all((addr + i) in byte for i in range(length)):
+            out[addr] = None
+            continue
+        data = bytes(byte[addr + i] for i in range(length))
+        if dtype == "uint":
+            v = int.from_bytes(data, "big")
+        elif dtype == "date":
+            v = datetime.datetime.fromtimestamp(int.from_bytes(data, "big"), tz=datetime.timezone.utc)
+        elif dtype == "hhmmss":
+            mm, ss = divmod(int.from_bytes(data, "big"), 60)
+            hh, mm = divmod(mm, 60)
+            v = f"{hh}:{mm:02d}:{ss:02d}"
+        elif dtype == "ascii":
+            v = '"' + data.decode("utf-8", "replace") + '"'
+        elif dtype == "sn":
+            v = f"Type: {int.from_bytes(data[0:2], 'big'):3d}, Serial: {int.from_bytes(data[2:5], 'big'):d}"
+        elif dtype == "adc_t":
+            v = m18.M18.calculate_temperature(None, int.from_bytes(data, "big"))
+        elif dtype == "dec_t":
+            v = f"{data[0] + data[1] / 256:.2f}"
+        elif dtype == "cell_v":
+            v = [int.from_bytes(data[i:i + 2], "big") for i in range(0, 10, 2)]
+        else:
+            v = int.from_bytes(data, "big")
+        out[addr] = v
+    return out
 
 
 class M18Bridge(m18.M18):
     """m18.M18 that sends its battery commands through the ESP32 bridge."""
 
-    def __init__(self, target):
-        self.link = open_link(target)
+    def __init__(self, target, password=None, sync_time=True):
+        self.link = open_link(target, password)
         self.port = self.link          # callers use m.port.close()
         self.target = self.link.device
         self.idle()
+        if sync_time:                  # offline bridges get the PC's clock for their records
+            try:
+                self._one(f"TIME {int(time.time())}")
+            except BridgeError:
+                pass
 
     def _one(self, line):
         return self.link.exec([line])[0]
@@ -311,6 +382,40 @@ class M18Bridge(m18.M18):
         r = self.link.exec(["SCAN"], timeout=30)[0]
         return json.loads(r[r.index("{"):]) if "{" in r else {"ok": False, "error": r}
 
+    # -- measurement history stored on the bridge ---------------------------
+    def _json(self, line, timeout=None):
+        r = self.link.exec([line], timeout=timeout)[0]
+        if not r.startswith("OK "):
+            raise BridgeError(r)
+        return json.loads(r[3:])
+
+    def history_stats(self):
+        return self._json("HSTAT")
+
+    def history_list(self, new_only=True):
+        """All record metas (oldest first)."""
+        items, after = [], 0
+        for _ in range(200):
+            page = self._json(f"HLIST {after} 100 {'new' if new_only else 'all'}")
+            items += page["items"]
+            after = page["next"]
+            if not after:
+                break
+        return items
+
+    def history_get(self, rid):
+        return self._json(f"HGET {int(rid)}", timeout=15)
+
+    def history_ack(self, rid):
+        r = self._one(f"HACK {int(rid)}")
+        if not r.startswith("OK"):
+            raise BridgeError(r)
+
+    def boot_info(self):
+        """{"boot":..., "uptime_ms":...} - lets the PC date records taken without a clock."""
+        info = json.loads(self.info()[3:])
+        return {"uptime_ms": int(info.get("uptime_s", 0)) * 1000, "boot": info.get("boot")}
+
     # -- not available through the bridge -----------------------------------
     def send(self, command):
         raise NotImplementedError("Über die ESP32-Brücke nicht verfügbar")
@@ -329,6 +434,10 @@ if __name__ == "__main__":
                     help="serieller Port (z. B. COM7, /dev/ttyUSB0) oder Netzwerkadresse "
                          "(m18-bridge.local, 192.168.1.50, http://...)")
     ap.add_argument("--health", action="store_true", help="Health-Report ausgeben und beenden")
+    ap.add_argument("--password", help="Passwort der Brücke (falls gesetzt)")
+    ap.add_argument("--sync", action="store_true",
+                    help="auf der Brücke gespeicherte Messungen in die Datenbank übernehmen")
+    ap.add_argument("--db", help="Datenbank für --sync (Standard: data/m18_fleet.db)")
     args = ap.parse_args()
     if args.discover or not args.bridge:
         found = discover()
@@ -337,7 +446,21 @@ if __name__ == "__main__":
         if not found:
             print("Keine M18-Brücke im Netzwerk gefunden.")
         raise SystemExit(0)
-    m = M18Bridge(args.bridge)
+    m = M18Bridge(args.bridge, password=args.password)
+    if args.sync:
+        import os
+        import sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(here, "gui"))
+        from bridge_import import import_from_bridge
+        from fleet import FleetDB
+        db = FleetDB(args.db or os.path.join(here, "data", "m18_fleet.db"))
+        res = import_from_bridge(db, m)
+        print(f"{res['imported']} übernommen, {res['created']} neue Akkus, {res['duplicates']} schon vorhanden, "
+              f"{len(res['errors'])} Fehler")
+        for e in res["errors"]:
+            print("  Fehler:", e)
+        raise SystemExit(0)
     print(f"Verbunden mit M18-Brücke {m.target}: {m.info()}")
     if args.health:
         m.health()

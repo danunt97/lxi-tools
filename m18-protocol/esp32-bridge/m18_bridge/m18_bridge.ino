@@ -29,6 +29,10 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <FS.h>
+#include <FFat.h>
+#include <LittleFS.h>
+#include <sys/time.h>
 #include <esp_system.h>
 #include <driver/uart.h>
 #include <time.h>
@@ -71,6 +75,7 @@ WiFiUDP disc;
 Preferences prefs;
 SemaphoreHandle_t batMutex;            // one user of the battery line at a time
 SemaphoreHandle_t stateMutex;          // protects lastScan
+SemaphoreHandle_t histMutex;           // protects the history store
 TaskHandle_t loopTaskHandle = nullptr;
 
 // ---------------------------------------------------------- watchdog helper
@@ -139,9 +144,105 @@ m18::Link batLink(port);
 m18::Reader reader(batLink, port);
 m18::CommandProcessor proc(batLink, reader);
 
+// ---------------------------------------------------------------- storage
+// Measurement history lives in the FAT partition ("16M Flash (3MB APP/9.9MB FATFS)");
+// LittleFS is used if the board was flashed with a SPIFFS/LittleFS partition instead.
+class FsStorage : public m18::Storage {
+ public:
+  const char* kind = "none";
+  bool mount() {
+    if (FFat.begin(true)) { fs_ = &FFat; fat_ = true; kind = "FAT"; return true; }
+    if (LittleFS.begin(true)) { fs_ = &LittleFS; fat_ = false; kind = "LittleFS"; return true; }
+    return false;
+  }
+  bool ok() override { return fs_ != nullptr; }
+  bool mkdir(const std::string& d) override { return fs_->exists(d.c_str()) || fs_->mkdir(d.c_str()); }
+  void list(const std::string& d, std::vector<std::string>& names) override {
+    File dir = fs_->open(d.c_str());
+    if (!dir || !dir.isDirectory()) return;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      String n = f.name();
+      int slash = n.lastIndexOf('/');
+      names.push_back((slash >= 0 ? n.substring(slash + 1) : n).c_str());
+      f.close();
+      feedWdt();
+    }
+  }
+  bool read(const std::string& p, std::string& out, bool firstLine) override {
+    File f = fs_->open(p.c_str(), "r");
+    if (!f) return false;
+    out.clear();
+    char buf[256];
+    while (f.available()) {
+      int n = f.read((uint8_t*)buf, sizeof(buf));
+      if (n <= 0) break;
+      if (firstLine) {
+        char* nl = (char*)memchr(buf, '\n', n);
+        if (nl) { out.append(buf, nl - buf); break; }
+      }
+      out.append(buf, n);
+    }
+    f.close();
+    return true;
+  }
+  bool write(const std::string& p, const std::string& data) override {
+    std::string tmp = p + ".tmp";
+    File f = fs_->open(tmp.c_str(), "w");
+    if (!f) return false;
+    size_t w = f.write((const uint8_t*)data.data(), data.size());
+    f.close();
+    if (w != data.size()) { fs_->remove(tmp.c_str()); return false; }
+    fs_->remove(p.c_str());
+    return fs_->rename(tmp.c_str(), p.c_str());
+  }
+  bool remove(const std::string& p) override { return fs_->remove(p.c_str()); }
+  bool rename(const std::string& a, const std::string& b) override { return fs_->rename(a.c_str(), b.c_str()); }
+  uint64_t freeBytes() override {
+    if (!fs_) return 0;
+    return fat_ ? (uint64_t)FFat.freeBytes() : (uint64_t)(LittleFS.totalBytes() - LittleFS.usedBytes());
+  }
+  uint64_t totalBytes() override {
+    if (!fs_) return 0;
+    return fat_ ? (uint64_t)FFat.totalBytes() : (uint64_t)LittleFS.totalBytes();
+  }
+ private:
+  fs::FS* fs_ = nullptr;
+  bool fat_ = false;
+};
+FsStorage storage;
+m18::History history(storage);
+
+static void histLock() { xSemaphoreTake(histMutex, portMAX_DELAY); }
+static void histUnlock() { xSemaphoreGive(histMutex); }
+
 static uint32_t unixNow() {
   time_t t = time(nullptr);
   return t > 1700000000 ? (uint32_t)t : 0;   // 0 = not synced, reader then uses the battery clock
+}
+
+// Time source for stored records: NTP when online; otherwise the phone's browser or
+// the PC set the clock (TIME command / read request), so offline records get a date.
+String timeSource = "none";
+uint32_t bootId = 0;
+String scanLoc, scanComment;                 // entered on the web page for the next read-out
+
+static bool setClockFrom(uint32_t t, const char* source) {
+  if (unixNow() || t < 1700000000UL) return false;    // already valid (NTP) or nonsense
+  struct timeval tv = {(time_t)t, 0};
+  settimeofday(&tv, nullptr);
+  timeSource = source;
+  return true;
+}
+static bool setClockFromPc(uint32_t t) { return setClockFrom(t, "pc"); }
+
+static void recordMeta(m18::RecordMeta& m) {
+  m.ts = unixNow();
+  if (m.ts && timeSource == "none") timeSource = "ntp";
+  m.tsSrc = m.ts ? timeSource.c_str() : "none";
+  m.boot = bootId;
+  m.upMs = millis();
+  m.loc = scanLoc.c_str();
+  m.comment = scanComment.c_str();
 }
 
 // Take the battery line, waiting (and feeding the watchdog) if the other side is busy.
@@ -166,6 +267,8 @@ volatile bool gotIp = false;
 uint32_t unlockUntil = 0;
 
 String lastScan = "{}";
+String webPass;                               // optional web/HTTP password (user "m18"), empty = off
+uint32_t authFails = 0;
 volatile bool scanRunning = false;
 volatile bool scanResultOk = false;
 uint32_t scanDoneAt = 0;
@@ -173,7 +276,6 @@ bool otaRunning = false;
 uint32_t lowHeapSince = 0;
 
 String infoExtra;
-static char replyBuf[2600];
 
 // --------------------------------------------------------------------- LED
 // On-board WS2812. Pin and brightness are stored in Preferences (web UI: Gerät).
@@ -299,6 +401,7 @@ void loadPrefs() {
   ledPin = prefs.getInt("ledpin", DEFAULT_LED_PIN);
   if (!ledPinAllowed(ledPin)) ledPin = DEFAULT_LED_PIN;
   ledBright = (uint8_t)prefs.getInt("ledbright", 40);
+  webPass = prefs.getString("webpass", "");
   prefs.end();
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -320,6 +423,15 @@ void saveWifi(const String& ssid, const String& pass) {
   savedSsid = ssid;
   savedPass = pass;
 }
+
+void savePassword(const String& pw) {
+  prefs.begin("m18", false);
+  prefs.putString("webpass", pw);
+  prefs.end();
+  webPass = pw;
+}
+
+String apPassword() { return webPass.length() >= 8 ? webPass : String(AP_PASSWORD); }
 
 void saveLed() {
   prefs.begin("m18", false);
@@ -344,7 +456,7 @@ void onWifiEvent(arduino_event_id_t event) {
 void startAP() {
   if (apActive) return;
   WiFi.mode(savedSsid.length() ? WIFI_AP_STA : WIFI_AP);
-  WiFi.softAP(apName.c_str(), AP_PASSWORD);
+  WiFi.softAP(apName.c_str(), apPassword().c_str());
   WiFi.setSleep(false);
   apActive = true;
   dns.setErrorReplyCode(DNSReplyCode::NoError);
@@ -352,7 +464,8 @@ void startAP() {
   dnsActive = true;
   apCloseAt = 0;
   if (wstate != WState::CONNECTING) wstate = WState::AP;
-  Serial.printf("Setup-WLAN \"%s\" (Passwort %s) -> http://%s\n", apName.c_str(), AP_PASSWORD,
+  Serial.printf("Setup-WLAN \"%s\" (Passwort %s) -> http://%s\n", apName.c_str(),
+                webPass.length() >= 8 ? "= Web-Passwort" : AP_PASSWORD,
                 WiFi.softAPIP().toString().c_str());
 }
 
@@ -452,7 +565,8 @@ void updateInfo() {
               "\",\"build\":\"" FW_BUILD "\",\"led_pin\":" + String(ledPin) + ",\"led_brightness\":" + String(ledBright) +
               ",\"unlocked\":" + (unlocked() ? "true" : "false") + ",\"unlock_s\":" + String(unlockS) +
               ",\"setup_client\":" + (clientOnSetupAp() ? "true" : "false") +
-              ",\"reading\":" + (scanRunning ? "true" : "false");
+              ",\"reading\":" + (scanRunning ? "true" : "false") + ",\"auth\":" + (webPass.length() ? "true" : "false") +
+              ",\"storage\":\"" + storage.kind + "\",\"time_src\":\"" + (unixNow() ? timeSource : String("none")) + "\",\"boot\":" + String((unsigned long)bootId);
   uint32_t now = unixNow();
   if (now) {
     char b[32];
@@ -494,6 +608,14 @@ String runCommand(const String& lineIn, bool physical) {
     saveWifi(ssid, pass);
     return "OK saved, restart with RESTART";
   }
+  if (up.startsWith("PASS ")) {                 // PASS <password>  or  PASS OFF
+    if (!physical) return "ERR LOCKED";
+    String pw = line.substring(5);
+    if (pw.equalsIgnoreCase("OFF")) { savePassword(""); return "OK password off"; }
+    if (pw.length() < 4 || pw.length() > 63) return "ERR PASSWORD (4-63 Zeichen)";
+    savePassword(pw);
+    return "OK password set";
+  }
   if (up == "RESTART") {
     if (!physical) return "ERR LOCKED";
     Serial.println("OK restarting");
@@ -505,34 +627,33 @@ String runCommand(const String& lineIn, bool physical) {
   bool battery = isBatteryCommand(up);
   if (battery && !lockBattery(BUSY_WAIT_MS)) return "ERR BUSY (Akku wird gerade ausgelesen)";
   bool scan = up.startsWith("SCAN");
-  if (scan) scanRunning = true;
-  proc.handle(line.c_str(), replyBuf, sizeof(replyBuf));
+  if (scan) { scanRunning = true; scanLoc = ""; scanComment = ""; }
+  std::string reply = proc.handle(line.c_str());
   if (scan) {
-    const char* json = strchr(replyBuf, '{');
-    String result = json ? String(json) : String("{}");
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    lastScan = result;
+    lastScan = proc.lastScanJson();
     xSemaphoreGive(stateMutex);
     scanResultOk = reader.ok();
     scanDoneAt = millis();
     scanRunning = false;
   }
   if (battery) unlockBattery();
-  return String(replyBuf);
+  return String(reply.c_str());
 }
 
 // Web read-out runs in its own task so the web server, LED and USB stay responsive.
-static char scanJson[2400];
 void scanTask(void*) {
+  String result;
   if (lockBattery(BUSY_WAIT_MS)) {
-    reader.read();
-    reader.toJson(scanJson, sizeof(scanJson), unixNow());
+    uint32_t id = proc.scan();                   // reads, decodes and stores in the history
+    result = proc.lastScanJson();
+    if (id) result = result.substring(0, result.length() - 1) + ",\"history_id\":" + String(id) + "}";
     unlockBattery();
   } else {
-    snprintf(scanJson, sizeof(scanJson), "{\"ok\":false,\"error\":\"Akku-Leitung belegt (PC liest gerade)\"}");
+    result = "{\"ok\":false,\"error\":\"Akku-Leitung belegt (PC liest gerade)\"}";
   }
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  lastScan = scanJson;
+  lastScan = result;
   xSemaphoreGive(stateMutex);
   scanResultOk = reader.ok();
   scanDoneAt = millis();
@@ -564,6 +685,30 @@ bool captiveRedirect() {
   return true;
 }
 
+// Optional password (HTTP Basic, user "m18"). Wrong attempts are slowed down.
+bool authOk() {
+  if (webPass.isEmpty()) return true;
+  if (server.authenticate("m18", webPass.c_str())) { authFails = 0; return true; }
+  if (server.header("Authorization").length()) {
+    authFails++;
+    delay(authFails * 250 > 2000 ? 2000 : authFails * 250);
+  }
+  server.requestAuthentication(BASIC_AUTH, "M18-Bruecke", "Passwort erforderlich");
+  return false;
+}
+
+// Wraps a handler with the password check.
+std::function<void()> guarded(std::function<void()> fn) {
+  return [fn]() { if (authOk()) fn(); };
+}
+
+// Runs a history command and sends its JSON (strips "OK ").
+void sendCmdJson(const String& cmd) {
+  String r = runCommand(cmd, false);
+  if (r.startsWith("OK ")) sendJson(r.substring(3));
+  else sendJson(String("{\"ok\":false,\"error\":\"") + jsonEsc(r) + "\"}", 400);
+}
+
 bool requireSettings() {
   if (settingsAllowed()) return true;
   sendJson("{\"ok\":false,\"locked\":true,\"error\":\"Gesperrt: kurz die BOOT-Taste am Gerät drücken "
@@ -574,10 +719,11 @@ bool requireSettings() {
 void setupHttp() {
   server.on("/", HTTP_GET, []() {
     if (captiveRedirect()) return;
+    if (!authOk()) return;
     server.sendHeader("Cache-Control", "no-store");
     server.send_P(200, "text/html; charset=utf-8", WEB_UI);
   });
-  server.on("/cmd", HTTP_POST, []() {
+  server.on("/cmd", HTTP_POST, guarded([]() {
     String body = server.arg("plain"), out;
     if (body.length() > MAX_CMD_BODY) { server.send(413, "text/plain", "ERR TOO LARGE\n"); return; }
     bool physical = settingsAllowed();
@@ -591,28 +737,33 @@ void setupHttp() {
       start = nl + 1;
     }
     server.send(200, "text/plain; charset=utf-8", out);
-  });
-  server.on("/api/info", HTTP_GET, []() {
+  }));
+  server.on("/api/info", HTTP_GET, guarded([]() {
     updateInfo();
-    proc.handle("INFO", replyBuf, sizeof(replyBuf));
-    sendJson(String(replyBuf + 3));
-  });
-  server.on("/api/read", HTTP_POST, []() {
+    std::string r = proc.handle("INFO");
+    sendJson(String(r.c_str() + 3));
+  }));
+  server.on("/api/read", HTTP_POST, guarded([]() {
+    if (server.hasArg("t")) setClockFrom((uint32_t)strtoul(server.arg("t").c_str(), nullptr, 10), "browser");
+    if (!scanRunning) {
+      scanLoc = server.arg("loc").substring(0, 60);
+      scanComment = server.arg("comment").substring(0, 200);
+    }
     if (startScan()) sendJson("{\"ok\":true,\"started\":true}");
     else sendJson("{\"ok\":false,\"busy\":true}", 409);
-  });
-  server.on("/api/status", HTTP_GET, []() {
+  }));
+  server.on("/api/status", HTTP_GET, guarded([]() {
     sendJson(String("{\"reading\":") + (scanRunning ? "true" : "false") + ",\"progress\":" +
              String(scanRunning ? reader.progressPercent() : 100) + ",\"done_ms_ago\":" +
              String(scanDoneAt ? millis() - scanDoneAt : 0) + "}");
-  });
-  server.on("/api/last", HTTP_GET, []() {
+  }));
+  server.on("/api/last", HTTP_GET, guarded([]() {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     String copy = lastScan;
     xSemaphoreGive(stateMutex);
     sendJson(copy);
-  });
-  server.on("/api/networks", HTTP_GET, []() {
+  }));
+  server.on("/api/networks", HTTP_GET, guarded([]() {
     // Asynchronous scan: first call starts it, the page polls until the list is ready.
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); sendJson("{\"scanning\":true}"); return; }
@@ -628,8 +779,8 @@ void setupHttp() {
     }
     WiFi.scanDelete();
     sendJson(out + "]}");
-  });
-  server.on("/api/wifi", HTTP_GET, []() {
+  }));
+  server.on("/api/wifi", HTTP_GET, guarded([]() {
     bool sta = WiFi.status() == WL_CONNECTED;
     int closesIn = apCloseAt ? (int)((int32_t)(apCloseAt - millis()) / 1000) : 0;
     sendJson(String("{\"state\":\"") + stateName() + "\",\"ssid\":\"" +
@@ -638,8 +789,8 @@ void setupHttp() {
              ".local\",\"rssi\":" + String(sta ? WiFi.RSSI() : 0) + ",\"ap\":\"" + apName +
              "\",\"ap_closes_in\":" + String(closesIn > 0 ? closesIn : 0) + ",\"error\":\"" + jsonEsc(wifiError) +
              "\",\"allowed\":" + (settingsAllowed() ? "true" : "false") + "}");
-  });
-  server.on("/api/wifi", HTTP_POST, []() {
+  }));
+  server.on("/api/wifi", HTTP_POST, guarded([]() {
     if (!requireSettings()) return;
     String ssid = server.arg("ssid"), pass = server.arg("pass"), h = sanitizeHost(server.arg("host"));
     if (ssid.isEmpty() || ssid.length() > 32) { sendJson("{\"ok\":false,\"error\":\"SSID ungültig\"}", 400); return; }
@@ -655,15 +806,15 @@ void setupHttp() {
     beginConnect(pendSsid, pendPass);
     startMdns();                                  // re-announce with the (possibly) new name
     sendJson("{\"ok\":true}");
-  });
-  server.on("/api/wifi/forget", HTTP_POST, []() {
+  }));
+  server.on("/api/wifi/forget", HTTP_POST, guarded([]() {
     if (!requireSettings()) return;
     saveWifi("", "");
     sendJson("{\"ok\":true}");
     delay(500);
     ESP.restart();
-  });
-  server.on("/api/led", HTTP_POST, []() {
+  }));
+  server.on("/api/led", HTTP_POST, guarded([]() {
     if (server.hasArg("pin")) {
       int pin = server.arg("pin").toInt();
       if (!ledPinAllowed(pin)) {
@@ -676,17 +827,18 @@ void setupHttp() {
     lastLedRgb = 0xFFFFFFFF;
     saveLed();
     sendJson("{\"ok\":true}");
-  });
-  server.on("/api/led/test", HTTP_POST, []() {
+  }));
+  server.on("/api/led/test", HTTP_POST, guarded([]() {
     if (server.hasArg("pin")) {
       int pin = server.arg("pin").toInt();
       if (ledPinAllowed(pin)) setLedPin(pin);
     }
     ledTestUntil = millis() + 2000;
     sendJson("{\"ok\":true}");
-  });
+  }));
   // Firmware update (.bin from Arduino IDE "Sketch > Export Compiled Binary").
   server.on("/api/update", HTTP_POST, []() {
+    if (!authOk()) return;
     if (!settingsAllowed()) { requireSettings(); return; }
     bool ok = !Update.hasError();
     sendJson(ok ? String("{\"ok\":true}") : String("{\"ok\":false,\"error\":\"") + jsonEsc(Update.errorString()) + "\"}",
@@ -695,7 +847,7 @@ void setupHttp() {
     if (ok) { delay(800); ESP.restart(); }
   }, []() {
     HTTPUpload& up = server.upload();
-    if (!settingsAllowed()) return;
+    if (!settingsAllowed() || (webPass.length() && !server.authenticate("m18", webPass.c_str()))) return;
     if (up.status == UPLOAD_FILE_START) {
       if (scanRunning || !lockBattery(2000)) { Update.abort(); return; }
       batLink.idle();                              // J2 low during the update
@@ -712,6 +864,33 @@ void setupHttp() {
       otaRunning = false;
     }
   });
+  // Measurement history (offline read-outs, imported by the PC software)
+  server.on("/api/history", HTTP_GET, guarded([]() {
+    String after = server.hasArg("after") ? server.arg("after") : String("0");
+    String max = server.hasArg("max") ? server.arg("max") : String("50");
+    sendCmdJson("HLIST " + String(after.toInt()) + " " + String(max.toInt()) + (server.arg("filter") == "new" ? " new" : " all"));
+  }));
+  server.on("/api/history/item", HTTP_GET, guarded([]() { sendCmdJson("HGET " + String(server.arg("id").toInt())); }));
+  server.on("/api/history/stats", HTTP_GET, guarded([]() { sendCmdJson("HSTAT"); }));
+  server.on("/api/history/delete", HTTP_POST, guarded([]() {
+    String r = runCommand("HDEL " + String(server.arg("id").toInt()), false);
+    sendJson(String("{\"ok\":") + (r.startsWith("OK") ? "true" : "false") + "}");
+  }));
+  server.on("/api/history/clear", HTTP_POST, guarded([]() {
+    String r = runCommand(server.arg("all") == "1" ? "HCLEAR all" : "HCLEAR synced", false);
+    sendJson(String("{\"ok\":true,\"deleted\":") + String(r.substring(3).toInt()) + "}");
+  }));
+  // Optional password for the web interface and the PC software.
+  server.on("/api/password", HTTP_POST, guarded([]() {
+    if (!requireSettings()) return;
+    String pw = server.arg("pass");
+    if (pw.length() && (pw.length() < 4 || pw.length() > 63)) {
+      sendJson("{\"ok\":false,\"error\":\"Passwort: 4–63 Zeichen (leer = aus)\"}", 400);
+      return;
+    }
+    savePassword(pw);
+    sendJson(String("{\"ok\":true,\"auth\":") + (pw.length() ? "true" : "false") + "}");
+  }));
   server.onNotFound([]() {
     if (captiveRedirect()) return;
     server.send(404, "text/plain", "not found");
@@ -728,7 +907,8 @@ void discoveryLoop() {
   disc.read(buf, sizeof(buf) - 1);
   if (strncmp(buf, "M18BRIDGE?", 10) != 0) return;
   String reply = String("M18BRIDGE ") + M18BRIDGE_VERSION + " host=" + hostName + ".local ip=" + ipString() +
-                 " http=80 mac=" + WiFi.macAddress() + "\n";
+                 " http=80 mac=" + WiFi.macAddress() + " auth=" + (webPass.length() ? "1" : "0") +
+                 " unsynced=" + String((unsigned)(history.ready() ? history.unsynced() : 0)) + "\n";
   disc.beginPacket(disc.remoteIP(), disc.remotePort());
   disc.write((const uint8_t*)reply.c_str(), reply.length());
   disc.endPacket();
@@ -770,6 +950,8 @@ void setup() {
   pinMode(PIN_BOOT, INPUT_PULLUP);
   batMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
+  histMutex = xSemaphoreCreateMutex();
+  bootId = esp_random();
   loopTaskHandle = xTaskGetCurrentTaskHandle();
 
   Serial.begin(HOST_BAUD);
@@ -780,6 +962,11 @@ void setup() {
 #endif
 #endif
   proc.setClock(unixNow);
+  proc.setTimeSetter(setClockFromPc);
+  proc.setMetaProvider(recordMeta);
+  history.setLock(histLock, histUnlock);
+  if (storage.mount() && history.begin()) proc.setHistory(&history);
+  else Serial.println("WARNUNG: kein Dateisystem - Messungen werden nicht gespeichert (Partition Scheme prüfen)");
 
   WiFi.persistent(false);
   WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
@@ -828,6 +1015,7 @@ void loop() {
     if (held > 5000) {
       led(255, 0, 0);
       saveWifi("", "");
+      savePassword("");                       // forgotten password: BOOT 5 s resets it too
       delay(300);
       ESP.restart();
     }

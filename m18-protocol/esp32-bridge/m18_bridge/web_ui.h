@@ -59,13 +59,25 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padd
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:640px){.two{grid-template-columns:1fr}}
 </style></head><body>
 <header><span class="logo">M18</span><h1>Akku-Brücke<small id="hostline">…</small></h1><span class="pill" id="pill">…</span></header>
-<nav><button data-tab="akku" class="on">Akku</button><button data-tab="wlan">WLAN</button><button data-tab="geraet">Gerät</button></nav>
+<nav><button data-tab="akku" class="on">Akku</button><button data-tab="verlauf">Verlauf <span id="newcount" class="pill ok" style="padding:0 7px;margin:0" hidden></span></button><button data-tab="wlan">WLAN</button><button data-tab="geraet">Gerät</button></nav>
 <main>
 <section id="tab-akku">
-  <div class="card"><button class="btn primary big" id="readbtn">Akku auslesen</button>
+  <div class="card">
+    <div class="two" style="gap:10px;margin-bottom:12px"><div><label style="margin-top:0">Standort / Kunde (optional)</label><input id="loc" maxlength="60" placeholder="z. B. Kunde Meier, Halle 2"></div>
+      <div><label style="margin-top:0">Kommentar (optional)</label><input id="comment" maxlength="200" placeholder="z. B. Akku 3 aus Koffer"></div></div>
+    <button class="btn primary big" id="readbtn">Akku auslesen</button>
     <div class="prog" id="prog" hidden><i></i></div>
     <p class="hint" id="readhint">Akku am Adapter anschließen und auslesen (dauert ca. 7 Sekunden).</p></div>
   <div id="result"></div>
+</section>
+<section id="tab-verlauf" hidden>
+  <div class="card"><h2>Gespeicherte Messungen</h2><div id="hstats">…</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+      <button class="btn" id="hexport">Alle als JSON exportieren</button><button class="btn" id="hclear">Übernommene löschen</button></div>
+    <p class="hint">Jede erfolgreiche Messung wird auf der Brücke gespeichert. Die PC-Software übernimmt sie in die Datenbank
+      (Auslesen → Brücke verbinden → „Übernehmen“) – oder die JSON-Datei dort unter Einstellungen importieren.</p></div>
+  <div class="card"><div id="hlist"></div><button class="btn" id="hmore" hidden style="margin-top:10px">Ältere laden</button></div>
+  <div id="hview"></div>
 </section>
 <section id="tab-wlan" hidden>
   <div class="card"><h2>Verbindung</h2><div id="wifistate">…</div></div>
@@ -96,11 +108,17 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padd
     <input type="file" id="fwfile" accept=".bin"><button class="btn primary" id="fwbtn" style="margin-top:10px">Firmware hochladen</button>
     <div class="prog" id="fwprog" hidden><i></i></div><div id="fwres"></div>
     <p class="hint">.bin aus der Arduino IDE: <i>Sketch → Kompilierte Binärdatei exportieren</i> (die Datei ohne „bootloader“/„merged“ im Namen).</p></div></div>
+  <div class="card"><h2>Zugriffsschutz</h2><div id="passstate"></div>
+    <label>Neues Passwort (leer lassen = Schutz aus)</label><input id="newpass" type="password" autocomplete="new-password" maxlength="63">
+    <label>Wiederholen</label><input id="newpass2" type="password" autocomplete="new-password" maxlength="63">
+    <button class="btn primary" id="passbtn" style="margin-top:10px">Speichern</button>
+    <p class="hint">Schützt Weboberfläche und PC-Zugriff (Benutzer „m18“). Ab 8 Zeichen gilt es auch für das Einrichtungs-WLAN.
+      Vergessen? BOOT-Taste 5 s halten setzt WLAN und Passwort zurück.</p></div>
   <div class="card"><h2>Befehle</h2><textarea id="cmd" rows="4">PING
 RESET
 READ 0x400A 10
 IDLE</textarea><button class="btn" id="cmdbtn" style="margin-top:8px">Senden</button><pre id="cmdres" hidden></pre>
-    <p class="hint">PING · RESET · IDLE · READ &lt;addr&gt; &lt;len&gt; · NOTE &lt;addr&gt; &lt;byte&gt; · SCAN · INFO</p></div>
+    <p class="hint">PING · RESET · IDLE · READ &lt;addr&gt; &lt;len&gt; · NOTE &lt;addr&gt; &lt;byte&gt; · SCAN · INFO · HSTAT · HLIST · HGET &lt;id&gt;</p></div>
 </section>
 </main>
 <script>
@@ -111,7 +129,7 @@ const fd=s=>s?new Date(s+"T00:00:00Z").toLocaleDateString("de-DE"):"–";
 let INFO={};
 async function j(url,opt){const r=await fetch(url,opt);return r.json();}
 function tab(name){$$("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab==name));$$("main>section").forEach(s=>s.hidden=s.id!="tab-"+name);
-  if(name=="wlan")wifiState();if(name=="geraet")devInfo();}
+  if(name=="wlan")wifiState();if(name=="geraet")devInfo();if(name=="verlauf"){histStats();histLoad(true);}}
 $$("nav button").forEach(b=>b.onclick=()=>tab(b.dataset.tab));
 
 async function info(){try{INFO=await j("/api/info");}catch(e){return;}
@@ -120,11 +138,13 @@ async function info(){try{INFO=await j("/api/info");}catch(e){return;}
   p.textContent=w=="sta"?"WLAN: "+INFO.ssid:"Einrichtungsmodus";
   $("#hostline").textContent=(w=="sta"?"http://"+INFO.host+" · "+INFO.ip:"WLAN „"+INFO.ap+"“ · "+INFO.ap_ip);
   if(!$("#host").value){$("#host").value=INFO.host.replace(".local","");hostPreview();}
+  try{const hs=await j("/api/history/stats");$("#newcount").hidden=!hs.unsynced;$("#newcount").textContent=hs.unsynced||"";}catch(e){}
   const allowed=INFO.setup_client||INFO.unlocked;
   const lock=allowed?(INFO.unlocked?`<div class="box ok">Einstellungen entsperrt (noch ${INFO.unlock_s} s).</div>`:""):
     `<div class="box info">🔒 Änderungen sind gesperrt. Kurz die <b>BOOT-Taste</b> am Gerät drücken – dann 2 Minuten entsperrt (LED türkis).</div>`;
   $("#lockbox").innerHTML=lock;$("#otalock").innerHTML=lock;
-  $$("#wifiform input,#wifiform button,#forget,#fwbtn,#fwfile").forEach(e=>e.disabled=!allowed);
+  $$("#wifiform input,#wifiform button,#forget,#fwbtn,#fwfile,#newpass,#newpass2,#passbtn").forEach(e=>e.disabled=!allowed);
+  $("#passstate").innerHTML=(INFO.auth?'<div class="box ok" style="margin-top:0">🔒 Passwortschutz ist aktiv.</div>':'<div class="box info" style="margin-top:0">Kein Passwort gesetzt – jeder im WLAN kann die Brücke nutzen.</div>')+lock;
   return INFO;}
 function hostPreview(){$("#hostpreview").textContent="http://"+($("#host").value||"m18-bridge")+".local";}
 $("#host").oninput=hostPreview;
@@ -183,11 +203,15 @@ function render(d,when){
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 $("#readbtn").onclick=async()=>{const b=$("#readbtn"),pg=$("#prog");b.disabled=true;b.innerHTML='<span class="spin"></span> Lese Akku …';
   pg.hidden=false;pg.firstChild.style.width="0%";
-  try{const r=await fetch("/api/read",{method:"POST"});
+  try{try{localStorage.setItem("m18.loc",$("#loc").value);localStorage.setItem("m18.comment",$("#comment").value);}catch(e){}
+    const body=new URLSearchParams({t:Math.floor(Date.now()/1000),loc:$("#loc").value,comment:$("#comment").value});
+    const r=await fetch("/api/read",{method:"POST",body});
     if(r.status==409){$("#readhint").textContent="Gerät ist beschäftigt (PC liest gerade über die Brücke) – gleich nochmal versuchen.";return;}
     for(let i=0;i<120;i++){await sleep(500);let st;try{st=await j("/api/status");}catch(e){continue;}
       pg.firstChild.style.width=st.progress+"%";if(!st.reading)break;}
-    render(await j("/api/last"),new Date().toLocaleTimeString("de-DE"));}
+    const d=await j("/api/last");render(d,new Date().toLocaleTimeString("de-DE"));
+    if(d.history_id)$("#readhint").textContent="Gespeichert als Messung #"+d.history_id+" – wird bei der nächsten Übernahme in die PC-Datenbank übertragen.";
+    $("#comment").value="";info();}
   catch(e){$("#result").innerHTML=`<div class="card"><div class="box err">Keine Antwort vom Gerät.</div></div>`;}
   finally{b.disabled=false;b.textContent="Akku erneut auslesen";pg.hidden=true;}};
 
@@ -233,6 +257,46 @@ async function devInfo(){const i=await info();if(!i)return;ledInit();
 async function cmd(text){return (await fetch("/cmd",{method:"POST",headers:{"Content-Type":"text/plain"},body:text})).text();}
 $("#testbtn").onclick=async()=>{$("#testres").innerHTML='<p class="hint">…</p>';const r=await cmd("RESET\nIDLE");
   $("#testres").innerHTML=r.startsWith("OK ACK")?'<div class="box ok">✓ Akku antwortet (Sync 0xAA)</div>':`<div class="box err">✗ Keine Antwort – Verkabelung prüfen<br><span class="mono">${esc(r)}</span></div>`;};
+/* ---------- Verlauf ---------- */
+let hNext=0,hItems=[];
+function fdt(ts){return ts?new Date(ts*1000).toLocaleString("de-DE",{dateStyle:"short",timeStyle:"short"}):"Zeit unbekannt";}
+async function histStats(){const s=await j("/api/history/stats");
+  if(s.ok===false||!s.ready){$("#hstats").innerHTML='<div class="box err" style="margin-top:0">Kein Speicher verfügbar – Partition Scheme „16M Flash (3MB APP/9.9MB FATFS)“ wählen.</div>';return s;}
+  $("#hstats").innerHTML=`<div class="row"><span>Messungen</span><span>${nf(s.count)}</span></div>
+    <div class="row"><span>Noch nicht in der PC-Datenbank</span><span class="${s.unsynced?"warn":""}">${nf(s.unsynced)}</span></div>
+    <div class="row"><span>Speicher frei</span><span>${nf(s.free_kb/1024,1)} von ${nf(s.total_kb/1024,1)} MB</span></div>`;return s;}
+function histRow(m){return `<div class="net" data-id="${m.id}"><span><b>${esc(m.note||m.eserial||"?")}</b> <span class="mono">${esc(m.model||"")}</span><br>
+  <span class="hint" style="margin:0">${fdt(m.ts)}${m.loc?" · 📍 "+esc(m.loc):""}${m.comment?" · "+esc(m.comment):""}</span></span>
+  <span style="text-align:right"><b class="${m.health>=80?"good":m.health>=60?"watch":"weak"}">${m.health??"–"}</b><br>
+  <span class="bars">${m.synced?"✓ übernommen":"neu"}</span></span></div>`;}
+async function histLoad(reset){
+  if(reset){hNext=0;hItems=[];}
+  // newest first: page through all ids once (ascending), then show reversed
+  let after=hNext,guard=0;const page=[];
+  do{const r=await j("/api/history?after="+after+"&max=100&filter=all");if(r.ok===false)break;page.push(...r.items);after=r.next;guard++;}while(after&&guard<40);
+  hItems=page.reverse();
+  $("#hlist").innerHTML=hItems.length?hItems.map(histRow).join(""):'<p class="hint">Noch keine Messungen gespeichert.</p>';
+  $$("#hlist .net").forEach(n=>n.onclick=()=>histView(n.dataset.id));}
+async function histView(id){const r=await j("/api/history/item?id="+id);if(r.ok===false)return;
+  const m=r.meta;render(r.scan,fdt(m.ts));const res=$("#result").innerHTML;$("#result").innerHTML="";
+  $("#hview").innerHTML=`<div class="card"><h2>Messung #${m.id} · ${fdt(m.ts)}${m.loc?" · "+esc(m.loc):""}</h2>${m.comment?`<p>${esc(m.comment)}</p>`:""}
+    <button class="btn" id="hdel">Diese Messung löschen</button></div>`+res;
+  $("#hdel").onclick=async()=>{if(!confirm("Messung #"+m.id+" löschen?"))return;await fetch("/api/history/delete",{method:"POST",body:new URLSearchParams({id:m.id})});
+    $("#hview").innerHTML="";histStats();histLoad(true);};
+  $("#hview").scrollIntoView({behavior:"smooth"});}
+$("#hexport").onclick=async()=>{const b=$("#hexport");b.disabled=true;const recs=[];
+  try{for(let i=0;i<hItems.length;i++){b.textContent="Exportiere "+(i+1)+"/"+hItems.length+" …";const r=await j("/api/history/item?id="+hItems[i].id);if(r.meta)recs.push(r);}
+    const blob=new Blob([JSON.stringify({format:"m18-bridge-export",version:1,device:INFO.host,exported:new Date().toISOString(),records:recs})],{type:"application/json"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="m18-bruecke-"+new Date().toISOString().slice(0,10)+".json";a.click();}
+  finally{b.disabled=false;b.textContent="Alle als JSON exportieren";}};
+$("#hclear").onclick=async()=>{if(!confirm("Alle bereits in die PC-Datenbank übernommenen Messungen von der Brücke löschen?"))return;
+  const r=await j("/api/history/clear",{method:"POST"});alert(r.deleted+" Messungen gelöscht");histStats();histLoad(true);};
+/* ---------- Passwort ---------- */
+$("#passbtn").onclick=async()=>{const a=$("#newpass").value,b=$("#newpass2").value;
+  if(a!==b){alert("Die Passwörter stimmen nicht überein");return;}
+  const r=await fetch("/api/password",{method:"POST",body:new URLSearchParams({pass:a})});const e=await r.json().catch(()=>({}));
+  if(!r.ok){alert("Fehler: "+(e.error||r.status));return;}
+  alert(a?"Passwort gesetzt. Der Browser fragt gleich danach (Benutzer „m18“).":"Passwortschutz ausgeschaltet.");$("#newpass").value=$("#newpass2").value="";location.reload();};
 /* LED */
 function ledPinValue(){const v=$("#ledpin").value;return v=="custom"?$("#ledcustom").value:v;}
 function ledInit(){if(INFO.led_pin==null)return;const p=String(INFO.led_pin);
@@ -255,6 +319,7 @@ $("#fwbtn").onclick=()=>{const f=$("#fwfile").files[0];if(!f){alert("Bitte zuers
   x.open("POST","/api/update");x.send(fd);};
 $("#cmdbtn").onclick=async()=>{const p=$("#cmdres");p.hidden=false;p.textContent="…";p.textContent=await cmd($("#cmd").value);};
 
+try{$("#loc").value=localStorage.getItem("m18.loc")||"";}catch(e){}
 (async()=>{await info();try{const d=await j("/api/last");if(d&&d.eserial!==undefined)render(d,"zuletzt");}catch(e){}
   if(INFO.wifi!="sta")tab("wlan");
   setInterval(()=>{const t=$("nav button.on").dataset.tab;info();if(t=="wlan")wifiState();},3000);})();
