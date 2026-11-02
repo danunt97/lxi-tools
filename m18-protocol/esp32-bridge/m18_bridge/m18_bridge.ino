@@ -30,6 +30,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include <esp_system.h>
+#include <driver/uart.h>
 #include <time.h>
 #include "m18_commands.h"
 #include "web_ui.h"
@@ -62,7 +63,8 @@
 #define MAX_CMD_BODY 16384
 #define LOW_HEAP_BYTES 30000
 
-HardwareSerial BatSerial(1);
+#define BAT_UART_NUM UART_NUM_1
+HardwareSerial BatSerial(1);          // UART1 = BAT_UART_NUM
 WebServer server(80);
 DNSServer dns;
 WiFiUDP disc;
@@ -77,27 +79,41 @@ static inline void feedWdt() {
 }
 
 // ------------------------------------------------------------ battery port
+// J2 idle (low) is produced by inverting the UART's TX line: an inverted UART idles
+// low, exactly like a held break. The UART is installed once at boot; idle/high only
+// flips the inversion flag (no pin re-routing, no driver re-install), which behaves
+// the same on Arduino-ESP32 2.0.x and 3.x (both use the ESP-IDF UART driver).
 class EspPort : public m18::Port {
  public:
   void begin() {
     pinMode(PIN_TX, OUTPUT);
     digitalWrite(PIN_TX, LOW);         // J2 low as early as possible
   }
-  void setIdle(bool idle) override {
-    if (idle) {
-      if (active_) { BatSerial.flush(); BatSerial.end(); active_ = false; }
-      pinMode(PIN_TX, OUTPUT);
-      digitalWrite(PIN_TX, LOW);
-    } else if (!active_) {
-      BatSerial.setRxBufferSize(512);
-      BatSerial.begin(4800, SERIAL_8N2, PIN_RX, PIN_TX);   // TX idles high
-      active_ = true;
-    }
+  void startUart() {                   // right after begin(); TX is high for a few µs only
+    BatSerial.setRxBufferSize(512);
+    BatSerial.begin(4800, SERIAL_8N2, PIN_RX, PIN_TX);
+    invertTx(true);
+    idle_ = true;
+    ready_ = true;
   }
-  void flushInput() override { if (active_) while (BatSerial.available()) BatSerial.read(); }
-  void write(const uint8_t* d, size_t n) override { if (active_) { BatSerial.write(d, n); BatSerial.flush(); } }
+  void setIdle(bool idle) override {
+    if (!ready_) return;
+    if (idle) {
+      BatSerial.flush();               // let the last stop bits go out first
+      invertTx(true);
+    } else {
+      invertTx(false);
+    }
+    idle_ = idle;
+  }
+  void flushInput() override { while (BatSerial.available()) BatSerial.read(); }
+  void write(const uint8_t* d, size_t n) override {
+    if (!ready_ || idle_) return;      // never clock data out while J2 must stay low
+    BatSerial.write(d, n);
+    BatSerial.flush();
+  }
   int readByte(uint32_t timeoutMs) override {
-    if (!active_) return -1;
+    if (!ready_) return -1;
     uint32_t t0 = ::millis();
     do {
       if (BatSerial.available()) return BatSerial.read();
@@ -111,7 +127,11 @@ class EspPort : public m18::Port {
   }
   uint32_t millis() override { return ::millis(); }
  private:
-  bool active_ = false;
+  static void invertTx(bool on) {
+    uart_set_line_inverse(BAT_UART_NUM, on ? UART_SIGNAL_TXD_INV : UART_SIGNAL_INV_DISABLE);
+  }
+  bool idle_ = true;
+  bool ready_ = false;
 };
 
 EspPort port;
@@ -386,6 +406,7 @@ void wifiLoop() {
       WiFi.setAutoReconnect(false);
       WiFi.disconnect();
       portalConnect = false;
+      lastStaRetry = millis();                  // next quiet retry in STA_RETRY_MS, not immediately
       if (!apActive) startAP();
     }
   } else if (wstate == WState::STA) {
@@ -745,6 +766,7 @@ uint32_t bootPressedSince = 0;
 
 void setup() {
   port.begin();                                 // J2 low first - before anything else
+  port.startUart();                             // UART with inverted (= low) TX idle
   pinMode(PIN_BOOT, INPUT_PULLUP);
   batMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
@@ -764,17 +786,12 @@ void setup() {
   loadPrefs();
   led(0, 0, 255);
   WiFi.setHostname(hostName.c_str());
+  // Non-blocking: USB answers immediately while Wi-Fi connects in the background
+  // (wifiLoop opens the setup AP if the saved network is not reachable).
   if (savedSsid.length()) {
     WiFi.mode(WIFI_STA);
     beginConnect(savedSsid, savedPass);
-    while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 12000) delay(100);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    onConnected();
   } else {
-    // No (reachable) Wi-Fi: stop background reconnects (they disturb the AP), open the setup AP.
-    WiFi.setAutoReconnect(false);
-    WiFi.disconnect();
     wstate = WState::AP;
     startAP();
     lastStaRetry = millis();

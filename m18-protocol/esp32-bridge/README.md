@@ -58,6 +58,8 @@ nichts, ist der andere Pin der richtige.
 | Maßnahme | Wirkung |
 |---|---|
 | J2 sofort beim Start Low, 2,2-kΩ-Pull-Down, Auto-Idle nach 8 s | Keine versehentlich gezählten „Dumb Charges“ |
+| Ruhezustand über TX-Invertierung im UART statt UART aus/an | Kein Umhängen von Pins, gleiches Verhalten auf Core 2.x und 3.x |
+| WLAN-Aufbau im Hintergrund | USB antwortet sofort nach dem Einschalten, auch während das WLAN verbindet |
 | Bis zu 3 Reset-Versuche, Wiederholung und Resync pro Block | Ein verlorenes Byte bricht das Auslesen nicht ab |
 | Abbruch nach 3 Blöcken ohne Antwort | Gezogener Akku → Fehlermeldung nach wenigen Sekunden statt Hängen |
 | Plausibilitätsprüfung | Unplausible Zellspannungen, fehlende Blöcke und Prüfsummenabweichungen erscheinen als Warnung |
@@ -68,6 +70,10 @@ nichts, ist der andere Pin der richtige.
 | WLAN-Stromsparmodus aus, mDNS-Neustart bei neuer IP | Zuverlässige Erreichbarkeit und Suche |
 | Asynchrone WLAN-Suche | Der WLAN-Scan blockiert nichts |
 | USB: Sende-Timeout 0, Zeilenlänge begrenzt | Kein Hängen, wenn kein PC am USB lauscht |
+
+Hinweis für die Kommandozeile: Nach 8 s ohne Befehl legt die Brücke J2 automatisch auf Low. Wer in der
+interaktiven Shell zwischen `m.reset()` und `m.cmd(...)` länger wartet, bekommt `ERR IDLE`, dann einfach erneut `m.reset()`.
+`read_id()`, `health()` und die GUI sind davon nicht betroffen.
 | PC-Seite: automatische Wiederholung, USB wird nach Reset neu geöffnet | WLAN-Aussetzer oder ein ESP-Neustart brechen einen Lesevorgang nicht ab |
 
 **Sperre für Einstellungen:** WLAN-Daten ändern oder löschen und Firmware aufspielen geht nur
