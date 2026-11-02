@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="de" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Akku-Bericht</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    @page { size: A4; margin: 14mm 13mm 16mm; }
+    body { background: #e9ebee; }
+    .toolbar { max-width: 210mm; margin: 16px auto 0; display: flex; gap: 8px; justify-content: flex-end; padding: 0 4px; }
+    .page { background: #fff; max-width: 210mm; margin: 12px auto 40px; padding: 14mm 13mm; box-shadow: 0 2px 14px rgba(0,0,0,.12); }
+    .rh { display: flex; gap: 18px; align-items: flex-start; border-bottom: 2px solid var(--accent); padding-bottom: 12px; margin-bottom: 16px; }
+    .rh h1 { font-size: 22px; }
+    .rh .meta { color: var(--muted); font-size: 12.5px; }
+    .rh img { width: 30mm; height: 30mm; margin-left: auto; }
+    .sec { margin-top: 16px; break-inside: avoid; }
+    .sec h2 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .kv { font-size: 12.5px; }
+    .stat { padding: 7px 9px; } .stat .v { font-size: 16px; }
+    table.list td, table.list th { padding: 4px 6px; font-size: 11.5px; }
+    .alert-item { grid-template-columns: 70px 1fr; padding: 5px 0; font-size: 12.5px; }
+    .alert-item .btn { display: none; }
+    .foot { margin-top: 18px; color: var(--faint); font-size: 11px; border-top: 1px solid var(--line); padding-top: 6px; }
+    @media print {
+      body { background: #fff; }
+      .toolbar { display: none; }
+      .page { box-shadow: none; margin: 0; padding: 0; max-width: none; }
+      .badge { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .chart, .gauge, .hbar { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <a class="btn" id="csv">CSV</a>
+    <button class="btn primary" onclick="window.print()">Drucken / als PDF speichern</button>
+  </div>
+  <div class="page" id="page"><p class="empty">Lade …</p></div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/charts.js"></script>
+  <script src="/static/widgets.js"></script>
+  <script src="/static/report.js"></script>
+</body>
+</html>

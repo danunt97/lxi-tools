@@ -5,7 +5,6 @@ import time
 from argparse import ArgumentParser
 from re import findall
 
-from requests import post
 from serial import Serial
 from serial.tools import list_ports
 
@@ -945,6 +944,7 @@ class M18:
         }
 
         # Submit the form
+        from requests import post  # imported lazily: only needed for submit_form
         response = post(form_url, data=form_data)
 
         # Check response

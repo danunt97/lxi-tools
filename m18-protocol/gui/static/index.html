@@ -1,83 +1,37 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>M18 Battery Tool</title>
-  <link rel="stylesheet" href="style.css">
+  <title>M18 Akku-Verwaltung</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="bar">
-    <span class="label">Port</span>
-    <select id="port" class="sel"></select>
-    <button id="rescan" class="btn" title="Rescan ports">⟳</button>
-    <button id="connect" class="btn green">Connect</button>
-    <button id="idle" class="btn" disabled>Idle (TX low)</button>
-    <label class="auto"><input type="checkbox" id="autorefresh"> auto-refresh</label>
+  <header class="top">
+    <a class="brand" href="/fleet" data-link>
+      <span class="logo">M18</span>
+      <span>Akku-Verwaltung<small>Milwaukee M18 · Zustand &amp; Alterung</small></span>
+    </a>
+    <nav>
+      <a href="/fleet" data-link data-nav="fleet">Flotte</a>
+      <a href="/read" data-link data-nav="read">Auslesen</a>
+      <a href="/alerts" data-link data-nav="alerts">Warnungen <span id="alertcount" class="count" hidden></span></a>
+      <a href="/settings" data-link data-nav="settings">Einstellungen</a>
+    </nav>
     <span class="spacer"></span>
-    <span id="dot" class="dot off"></span>
-    <span id="status" class="status">Not connected</span>
-  </div>
+    <span id="demopill" class="demo-pill" hidden>DEMO-MODUS</span>
+    <form class="search" id="search" autocomplete="off">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11l4 4"/></svg>
+      <input id="searchq" type="search" placeholder="Akku suchen / QR scannen …" aria-label="Akku suchen">
+    </form>
+  </header>
 
-  <div class="body">
-    <div class="col left">
-      <div class="card">
-        <h3>Health</h3>
-        <div class="health-row">
-          <div class="big"><span id="health">--</span><small>&nbsp;%</small></div>
-          <div id="healthstate" class="state">—</div>
-        </div>
-        <div class="metrics">
-          <div><span id="packv" class="m-val">--</span><span class="m-unit">V pack</span></div>
-          <div><span id="temp" class="m-val">--</span><span class="m-unit">°C</span></div>
-          <div><span id="imbalance" class="m-val">--</span><span class="m-unit">mV spread</span></div>
-        </div>
-      </div>
+  <main id="view"></main>
 
-      <div class="card">
-        <h3>Cell voltages</h3>
-        <div id="cells" class="cells"></div>
-      </div>
-    </div>
-
-    <div class="col right">
-      <div class="card">
-        <h3>Identity</h3>
-        <div class="kv"><span class="k">Serial</span><span class="v" id="serial">--</span></div>
-        <div class="kv"><span class="k">Cell type</span><span class="v" id="celltype">--</span></div>
-        <div class="kv"><span class="k">Manufactured</span><span class="v" id="manufactured">--</span></div>
-        <div class="kv"><span class="k">First charge</span><span class="v" id="firstcharge">--</span></div>
-        <div class="kv"><span class="k">Last charge</span><span class="v" id="lastcharge">--</span></div>
-        <div class="kv"><span class="k">Note</span><span class="v" id="note">--</span></div>
-      </div>
-
-      <div class="card">
-        <h3>Usage counters</h3>
-        <div class="kv"><span class="k">Total charges</span><span class="v" id="total_charges">--</span></div>
-        <div class="kv"><span class="k">Redlink charges</span><span class="v" id="redlink_charges">--</span></div>
-        <div class="kv"><span class="k">Dumb charges</span><span class="v" id="dumb_charges">--</span></div>
-        <div class="kv"><span class="k">Total discharge</span><span class="v" id="discharge">--</span></div>
-        <div class="kv"><span class="k">Overheat events</span><span class="v" id="overheat">--</span></div>
-        <div class="kv"><span class="k">Low-voltage events</span><span class="v" id="lowvolt">--</span></div>
-      </div>
-    </div>
-  </div>
-
-  <pre id="log" class="log"></pre>
-
-  <div class="footer">
-    <button id="read" class="btn" disabled>Read now</button>
-    <button id="raw" class="btn" disabled>Read all (raw)</button>
-    <button id="writenote" class="btn" disabled>Write note…</button>
-    <button id="export" class="btn" disabled>Export CSV</button>
-  </div>
-
-  <dialog id="rawdlg">
-    <h3>All registers</h3>
-    <pre id="rawtext"></pre>
-    <form method="dialog"><button class="btn">Close</button></form>
-  </dialog>
-
-  <script src="app.js"></script>
+  <script src="/static/common.js"></script>
+  <script src="/static/charts.js"></script>
+  <script src="/static/widgets.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

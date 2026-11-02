@@ -58,6 +58,26 @@ A spreadsheet template can be found below. Do NOT request access, go to `File ->
 
 https://docs.google.com/spreadsheets/d/1rZZ3mtU2uwuo_uMv7O7hi5kyPA9AXUDU5CBsHKWMi-U/
 
+## Battery management web app (GUI)
+
+`gui/m18_gui.py` is a local web app on top of `m18.py`. It reads packs, stores every read-out with a
+timestamp in a SQLite database, and provides:
+
+- a fleet overview
+- aging trends and alerts when a pack gets noticeably worse
+- editable location and comment fields
+- printable QR labels (P-touch / Brother QL)
+- per-pack reports and CSV export
+
+It needs only `pyserial` plus the Python standard library.
+
+```bash
+python gui/m18_gui.py          # real adapter
+python gui/m18_gui.py --demo   # simulated fleet, no hardware needed
+```
+
+See [gui/README.md](gui/README.md) (German) for details.
+
 ## Windows Users
 There are 4 .bat files for Windows users that are not familiar with the command line. Double-click on them to run them.
 * `m18_idle.bat` will prompt you to select a serial device, then bring the TX (J2) pin low. This is recommended before connecting to the battery to avoid increasing the counter for dumb-charges

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="de" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QR-Etiketten</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <style id="pagestyle"></style>
+  <style>
+    body { background: #e9ebee; }
+    .toolbar { background: var(--panel); border-bottom: 1px solid var(--line); padding: 14px 20px; display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+    .toolbar h1 { font-size: 18px; margin-right: 10px; align-self: center; }
+    .opts { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .help { max-width: 900px; margin: 14px auto 0; padding: 0 20px; }
+    .sheet { display: flex; flex-wrap: wrap; gap: 18px; padding: 24px 20px 60px; justify-content: center; }
+    .label {
+      background: #fff; color: #000; display: flex; align-items: center; overflow: hidden;
+      box-shadow: 0 2px 10px rgba(0,0,0,.15); border-radius: 1.5mm; font-family: "Inter", "Arial", sans-serif;
+    }
+    .label img { display: block; flex: none; image-rendering: pixelated; }
+    .label .txt { display: flex; flex-direction: column; justify-content: center; min-width: 0; line-height: 1.12; }
+    .label .n { font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .label .s { font-family: "JetBrains Mono", Consolas, monospace; white-space: nowrap; }
+    .label .m, .label .c { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    @media screen { .sheet .label { zoom: 2; } }
+    @media print {
+      body { background: #fff; }
+      .toolbar, .help, #toasts { display: none !important; }
+      .sheet { display: block; padding: 0; }
+      .label { box-shadow: none; border-radius: 0; page-break-after: always; break-after: page; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <h1>QR-Etiketten</h1>
+    <div class="opts">
+      <label class="field">Etikett / Band
+        <select id="tape">
+          <option value="12">P-touch 12 mm</option>
+          <option value="18">P-touch 18 mm</option>
+          <option value="24" selected>P-touch 24 mm</option>
+          <option value="36">P-touch 36 mm</option>
+          <option value="62">Brother QL 62 mm</option>
+        </select></label>
+      <label class="field">Länge (mm)<input id="len" type="number" min="15" max="200" step="1" style="width:80px"></label>
+      <label class="check"><input type="checkbox" id="o-model" checked> Modell</label>
+      <label class="check"><input type="checkbox" id="o-company" checked> Firma</label>
+      <label class="check"><input type="checkbox" id="o-loc"> Standort</label>
+    </div>
+    <span style="flex:1"></span>
+    <button class="btn" id="png">PNG für P-touch Editor</button>
+    <button class="btn primary" id="print">Drucken</button>
+  </div>
+  <p class="help hint">Drucken: im Druckdialog den Etikettendrucker wählen, Papierformat = Bandbreite × Länge, Ränder „Keine“, Skalierung 100 %.
+    Alternativ „PNG“ laden und im P-touch Editor als Bild einfügen. Jedes Etikett wird als eigene Seite gedruckt. Vorschau in doppelter Größe.</p>
+  <div class="sheet" id="sheet"></div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/label.js"></script>
+</body>
+</html>
