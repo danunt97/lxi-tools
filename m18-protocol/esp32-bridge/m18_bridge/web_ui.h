@@ -54,6 +54,8 @@ label{display:block;color:var(--muted);font-size:12.5px;margin:10px 0 4px}
 .box.info{background:rgba(90,162,255,.12);border-color:rgba(90,162,255,.4)}
 .big-url{font-size:17px;font-weight:650;word-break:break-all}
 pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:260px;overflow:auto}
+.prog{height:6px;background:var(--raise);border-radius:3px;overflow:hidden;margin-top:10px}.prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+.warn{color:var(--watch)}input[type=range]{padding:0}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:640px){.two{grid-template-columns:1fr}}
 </style></head><body>
 <header><span class="logo">M18</span><h1>Akku-Brücke<small id="hostline">…</small></h1><span class="pill" id="pill">…</span></header>
@@ -61,12 +63,13 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padd
 <main>
 <section id="tab-akku">
   <div class="card"><button class="btn primary big" id="readbtn">Akku auslesen</button>
+    <div class="prog" id="prog" hidden><i></i></div>
     <p class="hint" id="readhint">Akku am Adapter anschließen und auslesen (dauert ca. 7 Sekunden).</p></div>
   <div id="result"></div>
 </section>
 <section id="tab-wlan" hidden>
   <div class="card"><h2>Verbindung</h2><div id="wifistate">…</div></div>
-  <div class="card"><h2>Mit WLAN verbinden</h2>
+  <div class="card"><h2>Mit WLAN verbinden</h2><div id="lockbox"></div>
     <button class="btn" id="scanbtn">Netzwerke suchen</button><div class="nets" id="nets"></div>
     <form id="wifiform"><label>Netzwerk (SSID)</label><input name="ssid" id="ssid" required autocomplete="off">
       <label>Passwort</label><input name="pass" id="pass" type="password" autocomplete="off">
@@ -81,6 +84,18 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padd
   <div class="two"><div class="card"><h2>Status</h2><div id="devinfo"></div></div>
   <div class="card"><h2>Verbindungstest</h2><button class="btn" id="testbtn">Akku testen</button>
     <p class="hint">Sendet Reset und prüft, ob der Akku mit 0xAA antwortet.</p><div id="testres"></div></div></div>
+  <div class="two"><div class="card"><h2>Status-LED</h2>
+    <label>LED-Pin</label><select id="ledpin"><option value="48">GPIO 48 (DevKitC-1 v1.0, die meisten N16R8)</option>
+      <option value="38">GPIO 38 (DevKitC-1 v1.1)</option><option value="-1">aus</option><option value="custom">anderer Pin …</option></select>
+    <input id="ledcustom" type="number" min="1" max="48" placeholder="GPIO-Nummer" hidden style="margin-top:6px">
+    <label>Helligkeit</label><input id="ledbright" type="range" min="0" max="255">
+    <div style="display:flex;gap:8px;margin-top:10px"><button class="btn" id="ledtest">Testen (rot, grün, blau, weiß)</button><button class="btn primary" id="ledsave">Speichern</button></div>
+    <p class="hint">Grün = im WLAN · Blau blinkt = Einrichtungsmodus · Gelb = liest Akku · Grün kurz = gelesen · Rot blinkt = Fehler ·
+      Weiß blinkt = PC liest über die Brücke · Türkis = Einstellungen entsperrt · Lila = Firmware-Update</p></div>
+  <div class="card"><h2>Firmware-Update</h2><div id="otalock"></div>
+    <input type="file" id="fwfile" accept=".bin"><button class="btn primary" id="fwbtn" style="margin-top:10px">Firmware hochladen</button>
+    <div class="prog" id="fwprog" hidden><i></i></div><div id="fwres"></div>
+    <p class="hint">.bin aus der Arduino IDE: <i>Sketch → Kompilierte Binärdatei exportieren</i> (die Datei ohne „bootloader“/„merged“ im Namen).</p></div></div>
   <div class="card"><h2>Befehle</h2><textarea id="cmd" rows="4">PING
 RESET
 READ 0x400A 10
@@ -105,6 +120,11 @@ async function info(){try{INFO=await j("/api/info");}catch(e){return;}
   p.textContent=w=="sta"?"WLAN: "+INFO.ssid:"Einrichtungsmodus";
   $("#hostline").textContent=(w=="sta"?"http://"+INFO.host+" · "+INFO.ip:"WLAN „"+INFO.ap+"“ · "+INFO.ap_ip);
   if(!$("#host").value){$("#host").value=INFO.host.replace(".local","");hostPreview();}
+  const allowed=INFO.setup_client||INFO.unlocked;
+  const lock=allowed?(INFO.unlocked?`<div class="box ok">Einstellungen entsperrt (noch ${INFO.unlock_s} s).</div>`:""):
+    `<div class="box info">🔒 Änderungen sind gesperrt. Kurz die <b>BOOT-Taste</b> am Gerät drücken – dann 2 Minuten entsperrt (LED türkis).</div>`;
+  $("#lockbox").innerHTML=lock;$("#otalock").innerHTML=lock;
+  $$("#wifiform input,#wifiform button,#forget,#fwbtn,#fwfile").forEach(e=>e.disabled=!allowed);
   return INFO;}
 function hostPreview(){$("#hostpreview").textContent="http://"+($("#host").value||"m18-bridge")+".local";}
 $("#host").oninput=hostPreview;
@@ -122,7 +142,8 @@ function render(d,when){
   if(!d.ok){$("#result").innerHTML=`<div class="card"><div class="box err"><b>Auslesen fehlgeschlagen:</b> ${esc(d.error||"unbekannt")}<br>
     <span class="hint">Akku richtig aufgesteckt? Verkabelung J1/J2/B− prüfen. (${d.blocks_ok||0}/${d.blocks_total||0} Blöcke)</span></div></div>`;return;}
   const c=d.counters||{},cells=d.cells_mv||[],lo=Math.min(...cells),hi=Math.max(...cells);
-  $("#result").innerHTML=`
+  const warns=(d.warnings||[]).length?`<div class="card"><div class="box err" style="margin:0">${d.warnings.map(w=>"⚠ "+esc(w)).join("<br>")}</div></div>`:"";
+  $("#result").innerHTML=warns+`
   <div class="card"><div class="hero">${gauge(d.health,d.status)}
     <div class="title"><b>${esc(d.model)}</b><span class="mono">E-Seriennr. ${esc(d.eserial)}</span>${d.note?`<br><span>Notiz: „${esc(d.note)}“</span>`:""}
     <br><span class="badge ${d.status}">${STL[d.status]||d.status}</span> <span class="hint">Zustand (Schätzung)</span></div></div>
@@ -157,12 +178,18 @@ function render(d,when){
       <div class="row"><span>Entladen (Energie)</span><span>${nf(d.discharge_wh)} Wh</span></div>
       <div class="row"><span>Leer gefahren / Überstrom</span><span>${nf(c.discharge_to_empty)} / ${nf(c.overcurrent)}</span></div></div>
   </div>
-  <p class="hint">${when?"Ausgelesen "+when+" · ":""}${d.blocks_ok}/${d.blocks_total} Blöcke in ${nf(d.duration_ms/1000,1)} s ·
+  <p class="hint">${when?"Ausgelesen "+when+" · ":""}${d.blocks_ok}/${d.blocks_total} Blöcke in ${nf(d.duration_ms/1000,1)} s${d.retries?` · ${d.retries} Wiederholungen`:""} ·
     <a href="/api/last" download="m18-${esc(d.eserial)}.json" style="color:inherit">JSON</a></p>`;}
-$("#readbtn").onclick=async()=>{const b=$("#readbtn");b.disabled=true;b.innerHTML='<span class="spin"></span> Lese Akku …';
-  try{const d=await j("/api/read",{method:"POST"});render(d,new Date().toLocaleTimeString("de-DE"));}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+$("#readbtn").onclick=async()=>{const b=$("#readbtn"),pg=$("#prog");b.disabled=true;b.innerHTML='<span class="spin"></span> Lese Akku …';
+  pg.hidden=false;pg.firstChild.style.width="0%";
+  try{const r=await fetch("/api/read",{method:"POST"});
+    if(r.status==409){$("#readhint").textContent="Gerät ist beschäftigt (PC liest gerade über die Brücke) – gleich nochmal versuchen.";return;}
+    for(let i=0;i<120;i++){await sleep(500);let st;try{st=await j("/api/status");}catch(e){continue;}
+      pg.firstChild.style.width=st.progress+"%";if(!st.reading)break;}
+    render(await j("/api/last"),new Date().toLocaleTimeString("de-DE"));}
   catch(e){$("#result").innerHTML=`<div class="card"><div class="box err">Keine Antwort vom Gerät.</div></div>`;}
-  finally{b.disabled=false;b.textContent="Akku erneut auslesen";}};
+  finally{b.disabled=false;b.textContent="Akku erneut auslesen";pg.hidden=true;}};
 
 /* ---------- WLAN ---------- */
 async function wifiState(){const s=await j("/api/wifi");let h="";
@@ -174,13 +201,15 @@ async function wifiState(){const s=await j("/api/wifi");let h="";
   if(s.error)h+=`<div class="box err">${esc(s.error)}</div>`;
   $("#wifistate").innerHTML=h;return s;}
 $("#scanbtn").onclick=async()=>{const b=$("#scanbtn");b.disabled=true;b.innerHTML='<span class="spin"></span> Suche …';
-  try{const l=await j("/api/networks");$("#nets").innerHTML=l.length?l.map(n=>`<div class="net" data-ssid="${esc(n.ssid)}"><span>${n.secure?"🔒 ":""}${esc(n.ssid)}</span>
+  try{let r={scanning:true};for(let i=0;i<30&&r.scanning;i++){r=await j("/api/networks");if(r.scanning)await sleep(700);}
+    const l=r.networks||[];$("#nets").innerHTML=l.length?l.map(n=>`<div class="net" data-ssid="${esc(n.ssid)}"><span>${n.secure?"🔒 ":""}${esc(n.ssid)}</span>
     <span class="bars">${n.rssi>-60?"▂▄▆█":n.rssi>-70?"▂▄▆":n.rssi>-80?"▂▄":"▂"} ${n.rssi} dBm</span></div>`).join(""):'<p class="hint">Keine Netzwerke gefunden.</p>';
     $$(".net").forEach(n=>n.onclick=()=>{$("#ssid").value=n.dataset.ssid;$("#pass").focus();});}
   finally{b.disabled=false;b.textContent="Erneut suchen";}};
 $("#wifiform").onsubmit=async e=>{e.preventDefault();const body=new URLSearchParams(new FormData(e.target));
   $("#wifiprogress").innerHTML=`<div class="box info"><span class="spin" style="display:inline-block;vertical-align:middle"></span> Verbinde mit ${esc($("#ssid").value)} … (bis zu 20 s)</div>`;
-  await fetch("/api/wifi",{method:"POST",body});
+  const resp=await fetch("/api/wifi",{method:"POST",body});
+  if(!resp.ok){const e=await resp.json().catch(()=>({}));$("#wifiprogress").innerHTML=`<div class="box err">${esc(e.error||"Fehler")}</div>`;return;}
   const host=($("#host").value||"m18-bridge")+".local";
   for(let i=0;i<30;i++){await new Promise(r=>setTimeout(r,1000));let s;
     try{s=await j("/api/wifi");}catch(err){continue;}
@@ -191,19 +220,42 @@ $("#wifiform").onsubmit=async e=>{e.preventDefault();const body=new URLSearchPar
     if(s.state=="failed"){$("#wifiprogress").innerHTML=`<div class="box err">Verbindung fehlgeschlagen: ${esc(s.error||"")}. Passwort prüfen und erneut versuchen.</div>`;return;}}
   $("#wifiprogress").innerHTML=`<div class="box info">Keine Rückmeldung mehr – vermutlich hat das Gerät den Funkkanal gewechselt.
     Verbinde dich wieder mit deinem WLAN und öffne <span class="big-url">http://${esc(host)}</span>.</div>`;};
-$("#forget").onclick=async()=>{if(!confirm("WLAN-Daten löschen und neu starten?"))return;await fetch("/api/wifi/forget",{method:"POST"});
+$("#forget").onclick=async()=>{if(!confirm("WLAN-Daten löschen und neu starten?"))return;const r=await fetch("/api/wifi/forget",{method:"POST"});
+  if(!r.ok){const e=await r.json().catch(()=>({}));$("#wifistate").innerHTML=`<div class="box err">${esc(e.error||"Fehler")}</div>`;return;}
   $("#wifistate").innerHTML='<div class="box info">Gelöscht – das Gerät startet im Einrichtungsmodus neu.</div>';};
 
 /* ---------- Gerät ---------- */
-async function devInfo(){const i=await info();if(!i)return;
+async function devInfo(){const i=await info();if(!i)return;ledInit();
   $("#devinfo").innerHTML=[["Firmware",i.version],["Gerätename",i.host],["IP",i.ip||"–"],["WLAN",i.wifi=="sta"?i.ssid+" ("+i.rssi+" dBm)":"Einrichtungsmodus ("+i.ap+")"],
-   ["MAC",i.mac],["Akku-Leitung",i.line=="idle"?"Ruhe (J2 low)":"aktiv"],["Laufzeit",hms(i.uptime_s)],["Freier Speicher",nf(i.heap_kb)+" KB · PSRAM "+nf(i.psram_kb)+" KB"],
-   ["Uhrzeit",i.time||"nicht synchronisiert"]].map(r=>`<div class="row"><span>${r[0]}</span><span class="mono">${esc(r[1])}</span></div>`).join("");}
+   ["MAC",i.mac],["Akku-Leitung",i.line=="idle"?"Ruhe (J2 low)":"aktiv"],["Laufzeit",hms(i.uptime_s)],["Letzter Neustart",i.reset_reason],
+   ["Freier Speicher",nf(i.heap_kb)+" KB (min. "+nf(i.min_heap_kb)+") · PSRAM "+nf(i.psram_kb)+" KB"],
+   ["Uhrzeit",i.time||"nicht synchronisiert"],["Build",i.build]].map(r=>`<div class="row"><span>${r[0]}</span><span class="mono">${esc(r[1])}</span></div>`).join("");}
 async function cmd(text){return (await fetch("/cmd",{method:"POST",headers:{"Content-Type":"text/plain"},body:text})).text();}
 $("#testbtn").onclick=async()=>{$("#testres").innerHTML='<p class="hint">…</p>';const r=await cmd("RESET\nIDLE");
   $("#testres").innerHTML=r.startsWith("OK ACK")?'<div class="box ok">✓ Akku antwortet (Sync 0xAA)</div>':`<div class="box err">✗ Keine Antwort – Verkabelung prüfen<br><span class="mono">${esc(r)}</span></div>`;};
+/* LED */
+function ledPinValue(){const v=$("#ledpin").value;return v=="custom"?$("#ledcustom").value:v;}
+function ledInit(){if(INFO.led_pin==null)return;const p=String(INFO.led_pin);
+  if([...$("#ledpin").options].some(o=>o.value==p))$("#ledpin").value=p;else{$("#ledpin").value="custom";$("#ledcustom").hidden=false;$("#ledcustom").value=p;}
+  $("#ledbright").value=INFO.led_brightness;}
+$("#ledpin").onchange=()=>{$("#ledcustom").hidden=$("#ledpin").value!="custom";};
+$("#ledtest").onclick=()=>fetch("/api/led/test",{method:"POST",body:new URLSearchParams({pin:ledPinValue()})});
+$("#ledsave").onclick=async()=>{const r=await fetch("/api/led",{method:"POST",body:new URLSearchParams({pin:ledPinValue(),brightness:$("#ledbright").value})});
+  const e=await r.json().catch(()=>({}));alert(r.ok?"LED-Einstellung gespeichert":"Fehler: "+(e.error||r.status));};
+$("#ledbright").onchange=()=>fetch("/api/led",{method:"POST",body:new URLSearchParams({brightness:$("#ledbright").value})});
+/* Firmware update */
+$("#fwbtn").onclick=()=>{const f=$("#fwfile").files[0];if(!f){alert("Bitte zuerst die .bin-Datei wählen");return;}
+  if(!confirm("Firmware "+f.name+" ("+Math.round(f.size/1024)+" KB) aufspielen? Das Gerät startet danach neu."))return;
+  const x=new XMLHttpRequest(),fd=new FormData(),pg=$("#fwprog");fd.append("firmware",f,f.name);pg.hidden=false;
+  x.upload.onprogress=e=>{if(e.lengthComputable)pg.firstChild.style.width=(e.loaded/e.total*100)+"%";};
+  x.onload=()=>{let r={};try{r=JSON.parse(x.responseText);}catch(e){}
+    $("#fwres").innerHTML=r.ok?'<div class="box ok">✓ Update erfolgreich – Gerät startet neu. Seite in ca. 15 s neu laden.</div>'
+      :`<div class="box err">Update fehlgeschlagen: ${esc(r.error||x.status)}</div>`;};
+  x.onerror=()=>{$("#fwres").innerHTML='<div class="box err">Verbindung abgebrochen.</div>';};
+  x.open("POST","/api/update");x.send(fd);};
 $("#cmdbtn").onclick=async()=>{const p=$("#cmdres");p.hidden=false;p.textContent="…";p.textContent=await cmd($("#cmd").value);};
 
 (async()=>{await info();try{const d=await j("/api/last");if(d&&d.eserial!==undefined)render(d,"zuletzt");}catch(e){}
-  if(INFO.wifi!="sta")tab("wlan");setInterval(info,10000);})();
+  if(INFO.wifi!="sta")tab("wlan");
+  setInterval(()=>{const t=$("nav button.on").dataset.tab;info();if(t=="wlan")wifiState();},3000);})();
 </script></body></html>)HTML";

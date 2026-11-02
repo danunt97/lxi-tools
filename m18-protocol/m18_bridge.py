@@ -37,18 +37,64 @@ def is_network_target(target):
         (t.count(".") == 3 and t.replace(".", "").replace(":", "").isdigit())
 
 
-class SerialLink:
+BUSY_WAIT_S = 30          # the bridge answers "ERR BUSY" while it reads the battery itself
+
+
+class _LinkBase:
+    """Retry policy shared by USB and Wi-Fi.
+
+    Every bridge command is idempotent (reads, reset/idle, writing the same note
+    byte again), so transient failures - a lost Wi-Fi packet, a USB hiccup, the
+    board rebooting - are retried instead of aborting a 15-second read-out.
+    """
+    retries = 2
+
+    def exec(self, lines, timeout=None):
+        lines = [ln.strip() for ln in lines if ln.strip()]
+        busy_until = time.time() + BUSY_WAIT_S
+        attempt = 0
+        while True:
+            try:
+                out = self._exec(lines, timeout)
+            except BridgeError:
+                attempt += 1
+                if attempt > self.retries:
+                    raise
+                time.sleep(0.3 * attempt)
+                self._recover()
+                continue
+            if any(o.startswith("ERR BUSY") for o in out) and time.time() < busy_until:
+                time.sleep(1.0)
+                continue
+            return out
+
+    def _recover(self):
+        pass
+
+
+class SerialLink(_LinkBase):
     """ESP32 connected by USB: one text command per line, one reply per line."""
 
     def __init__(self, device, timeout=6.0):
-        import serial  # pyserial
         self.device = device
         self.timeout = timeout
+        self.ser = None
+        self._open()
+        self._wait_ready()
+
+    def _open(self):
+        import serial  # pyserial
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
         s = serial.Serial()
-        s.port = device
+        s.port = self.device
         s.baudrate = 115200
         s.timeout = 0.2
-        # Most ESP32 dev boards reset when DTR/RTS toggle; keep them released.
+        s.write_timeout = 2
+        # Classic ESP32 boards reset when DTR/RTS toggle; keep them released.
         try:
             s.dtr = False
             s.rts = False
@@ -56,43 +102,58 @@ class SerialLink:
             pass
         s.open()
         self.ser = s
-        self._wait_ready()
 
-    def _wait_ready(self):
+    def _wait_ready(self, seconds=5.0):
         # The board may have just rebooted: retry PING for a few seconds.
-        deadline = time.time() + 4.0
+        deadline = time.time() + seconds
         last = None
         while time.time() < deadline:
             try:
-                last = self.exec(["PING"], timeout=0.8)[0]
+                last = self._exec(["PING"], timeout=0.8)[0]
                 if last.startswith("OK M18BRIDGE"):
                     return
             except BridgeError as e:
                 last = str(e)
         raise BridgeError(f"Keine M18-Brücke an {self.device} (Antwort: {last!r})")
 
-    def exec(self, lines, timeout=None):
+    def _recover(self):
+        # USB re-enumerated (board reset, cable wiggle): reopen the port and resync.
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                self._open()
+                self._wait_ready(3.0)
+                return
+            except Exception:
+                time.sleep(0.5)
+
+    def _exec(self, lines, timeout=None):
+        import serial
         timeout = timeout or self.timeout
-        self.ser.reset_input_buffer()
         replies = []
-        for line in lines:
-            self.ser.write((line.strip() + "\n").encode("ascii"))
-            self.ser.flush()
-            deadline = time.time() + timeout
-            while True:
-                raw = self.ser.readline().decode("utf-8", "replace").strip()
-                if raw.startswith(("OK", "ERR")):
-                    replies.append(raw)
-                    break
-                if time.time() > deadline:
-                    raise BridgeError(f"Zeitüberschreitung bei {line!r}")
+        try:
+            self.ser.reset_input_buffer()
+            for line in lines:
+                self.ser.write((line + "\n").encode("utf-8"))
+                self.ser.flush()
+                deadline = time.time() + timeout
+                while True:
+                    raw = self.ser.readline().decode("utf-8", "replace").strip()
+                    if raw.startswith(("OK", "ERR")):
+                        replies.append(raw)
+                        break
+                    if time.time() > deadline:
+                        raise BridgeError(f"Zeitüberschreitung bei {line!r}")
+        except (serial.SerialException, OSError) as e:
+            raise BridgeError(f"USB-Verbindung zur Brücke unterbrochen: {e}") from e
         return replies
 
     def close(self):
-        self.ser.close()
+        if self.ser is not None:
+            self.ser.close()
 
 
-class HttpLink:
+class HttpLink(_LinkBase):
     """ESP32 on the network: POST /cmd with one command per line."""
 
     def __init__(self, target, timeout=10.0):
@@ -106,8 +167,8 @@ class HttpLink:
         if not r.startswith("OK M18BRIDGE"):
             raise BridgeError(f"{t} ist keine M18-Brücke (Antwort: {r!r})")
 
-    def exec(self, lines, timeout=None):
-        body = ("\n".join(line.strip() for line in lines) + "\n").encode("ascii")
+    def _exec(self, lines, timeout=None):
+        body = ("\n".join(lines) + "\n").encode("utf-8")
         req = urllib.request.Request(self.base + "/cmd", data=body, method="POST",
                                      headers={"Content-Type": "text/plain"})
         try:

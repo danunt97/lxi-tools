@@ -129,6 +129,46 @@ class TestBridge(unittest.TestCase):
             srv.shutdown()
             sim.close()
 
+    def test_http_flaky(self):
+        """Wi-Fi hiccups (dropped connections) and a busy bridge are retried transparently."""
+        sim = SimProcess(self.exe)
+        state = {"n": 0, "busy": 2}
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                state["n"] += 1
+                if state["n"] % 5 == 0:                 # drop every 5th request on the floor
+                    self.connection.close()
+                    return
+                lines = [ln for ln in body.splitlines() if ln.strip()]
+                if state["busy"] > 0 and lines[0].startswith("RESET"):
+                    state["busy"] -= 1
+                    out = "ERR BUSY (Akku wird gerade ausgelesen)\n".encode()
+                else:
+                    out = ("\n".join(sim.exec(lines)) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = m18_bridge.M18Bridge(f"http://127.0.0.1:{srv.server_address[1]}")
+            self.assertTrue(m.reset())                       # after two "ERR BUSY"
+            self.assertEqual(state["busy"], 0)
+            arr = m.read_id(output="array")
+            answered = sum(1 for _, v in arr if v is not None)
+            self.assertEqual(answered, len(m18.data_id))     # nothing lost despite drops
+            self.assertGreater(state["n"], 200)
+        finally:
+            srv.shutdown()
+            sim.close()
+
     def test_usb_serial(self):
         try:
             import serial  # noqa: F401

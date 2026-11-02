@@ -5,9 +5,17 @@
 //  - PC access over USB (115200 baud, text commands) or Wi-Fi (HTTP POST /cmd);
 //    m18_bridge.py / the web GUI use this transparently.
 //  - Own web interface: Wi-Fi setup in the customer's network (captive portal),
-//    direct battery read-out with decoded values (m18_reader.h), status, console.
+//    direct battery read-out with decoded values (m18_reader.h), status, LED,
+//    firmware update.
 //  - The PC finds the bridge on the network automatically (UDP discovery on
 //    port 18018 + mDNS <name>.local / _m18bridge._tcp).
+//  - On-board RGB LED shows the state (see README).
+//
+// Reliability: task watchdog, battery access serialised by a mutex, web read-out
+// in a background task, retries/resync while reading, J2 forced low on boot and
+// after 8 s of inactivity, Wi-Fi power save off, mDNS restart on new IP,
+// heap guard. Settings changes (Wi-Fi, firmware) need physical presence:
+// setup access point, USB, or a short press on BOOT (unlocks for 2 minutes).
 //
 // Arduino IDE settings for ESP32-S3-DevKitC-1 N16R8 (see README):
 //   Board "ESP32S3 Dev Module", Flash Size 16MB, PSRAM "OPI PSRAM",
@@ -20,9 +28,13 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <Update.h>
+#include <esp_system.h>
 #include <time.h>
 #include "m18_commands.h"
 #include "web_ui.h"
+
+#define FW_BUILD __DATE__ " " __TIME__
 
 // ----------------------------------------------------------------- settings
 #ifndef PIN_TX
@@ -31,11 +43,11 @@
 #ifndef PIN_RX
 #define PIN_RX 18          // <- 1 kOhm <- battery J1
 #endif
-#ifndef PIN_RGB
-#define PIN_RGB 48         // on-board RGB LED (DevKitC-1 v1.0: 48, v1.1: 38), -1 = none
+#ifndef DEFAULT_LED_PIN
+#define DEFAULT_LED_PIN 48 // on-board WS2812 (DevKitC-1 v1.0: 48, v1.1: 38); changeable in the web UI
 #endif
 #ifndef PIN_BOOT
-#define PIN_BOOT 0         // BOOT button: hold 5 s = forget Wi-Fi
+#define PIN_BOOT 0         // BOOT button: short press = unlock settings 2 min, hold 5 s = forget Wi-Fi
 #endif
 #define HOST_BAUD 115200
 #define AP_PASSWORD "m18bridge"        // setup access point password (min. 8 chars)
@@ -45,12 +57,24 @@
 #define AP_CLOSE_AFTER_MS 90000        // keep setup AP open this long after success
 #define AP_FALLBACK_MS 60000           // open setup AP after this long without Wi-Fi
 #define STA_RETRY_MS 60000             // retry saved Wi-Fi while in setup mode
+#define UNLOCK_MS 120000               // settings unlocked after a short BOOT press
+#define BUSY_WAIT_MS 25000             // max wait for the battery line (PC vs. web)
+#define MAX_CMD_BODY 16384
+#define LOW_HEAP_BYTES 30000
 
 HardwareSerial BatSerial(1);
 WebServer server(80);
 DNSServer dns;
 WiFiUDP disc;
 Preferences prefs;
+SemaphoreHandle_t batMutex;            // one user of the battery line at a time
+SemaphoreHandle_t stateMutex;          // protects lastScan
+TaskHandle_t loopTaskHandle = nullptr;
+
+// ---------------------------------------------------------- watchdog helper
+static inline void feedWdt() {
+  if (loopTaskHandle && xTaskGetCurrentTaskHandle() == loopTaskHandle) feedLoopWDT();
+}
 
 // ------------------------------------------------------------ battery port
 class EspPort : public m18::Port {
@@ -65,6 +89,7 @@ class EspPort : public m18::Port {
       pinMode(PIN_TX, OUTPUT);
       digitalWrite(PIN_TX, LOW);
     } else if (!active_) {
+      BatSerial.setRxBufferSize(512);
       BatSerial.begin(4800, SERIAL_8N2, PIN_RX, PIN_TX);   // TX idles high
       active_ = true;
     }
@@ -77,10 +102,13 @@ class EspPort : public m18::Port {
     do {
       if (BatSerial.available()) return BatSerial.read();
       delay(1);
+      feedWdt();
     } while (::millis() - t0 < timeoutMs);
     return -1;
   }
-  void delayMs(uint32_t ms) override { delay(ms); }
+  void delayMs(uint32_t ms) override {
+    while (ms) { uint32_t s = ms > 100 ? 100 : ms; delay(s); ms -= s; feedWdt(); }
+  }
   uint32_t millis() override { return ::millis(); }
  private:
   bool active_ = false;
@@ -96,32 +124,145 @@ static uint32_t unixNow() {
   return t > 1700000000 ? (uint32_t)t : 0;   // 0 = not synced, reader then uses the battery clock
 }
 
-// ------------------------------------------------------------------- LED
-static void led(uint8_t r, uint8_t g, uint8_t b) {
-#if PIN_RGB >= 0
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  rgbLedWrite(PIN_RGB, r, g, b);
-#else
-  neopixelWrite(PIN_RGB, r, g, b);
-#endif
-#endif
+// Take the battery line, waiting (and feeding the watchdog) if the other side is busy.
+static bool lockBattery(uint32_t maxWaitMs) {
+  uint32_t t0 = millis();
+  while (xSemaphoreTake(batMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    feedWdt();
+    if (millis() - t0 > maxWaitMs) return false;
+  }
+  return true;
 }
+static void unlockBattery() { xSemaphoreGive(batMutex); }
 
-// ------------------------------------------------------------------ Wi-Fi
+// ------------------------------------------------------------------- state
 enum class WState { AP, CONNECTING, STA, FAILED };
 WState wstate = WState::AP;
 String savedSsid, savedPass, hostName, apName, wifiError;
 String pendSsid, pendPass;
 bool apActive = false, dnsActive = false, portalConnect = false;
 uint32_t connectStart = 0, apCloseAt = 0, lostSince = 0, lastStaRetry = 0;
-String lastScan = "{}";
-String infoExtra;
-static char replyBuf[2400];
+volatile bool gotIp = false;
+uint32_t unlockUntil = 0;
 
+String lastScan = "{}";
+volatile bool scanRunning = false;
+volatile bool scanResultOk = false;
+uint32_t scanDoneAt = 0;
+bool otaRunning = false;
+uint32_t lowHeapSince = 0;
+
+String infoExtra;
+static char replyBuf[2600];
+
+// --------------------------------------------------------------------- LED
+// On-board WS2812. Pin and brightness are stored in Preferences (web UI: Gerät).
+int ledPin = DEFAULT_LED_PIN;
+uint8_t ledBright = 40;                // 0..255, scaled per colour
+uint32_t ledTestUntil = 0;
+uint32_t lastLedRgb = 0xFFFFFFFF, lastLedWrite = 0;
+
+static void ledWrite(int pin, uint8_t r, uint8_t g, uint8_t b) {
+  if (pin < 0) return;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  rgbLedWrite(pin, r, g, b);
+#else
+  neopixelWrite(pin, r, g, b);
+#endif
+}
+
+static void led(uint8_t r, uint8_t g, uint8_t b) {
+  uint32_t rgb = (uint32_t)r << 16 | (uint32_t)g << 8 | b;
+  // write on change, refresh every 2 s (recovers from glitches on the data line)
+  if (rgb == lastLedRgb && millis() - lastLedWrite < 2000) return;
+  lastLedRgb = rgb;
+  lastLedWrite = millis();
+  ledWrite(ledPin, (uint16_t)r * ledBright / 255, (uint16_t)g * ledBright / 255, (uint16_t)b * ledBright / 255);
+}
+
+// Pins the LED may never use on the S3: battery UART, BOOT, native USB (19/20),
+// flash/PSRAM of the N16R8 (26-37), UART0 of the second USB socket (43/44).
+static bool ledPinAllowed(int pin) {
+  if (pin == -1) return true;
+  if (pin < 1 || pin > 48) return false;
+  if (pin == PIN_TX || pin == PIN_RX || pin == PIN_BOOT || pin == 19 || pin == 20 || pin == 43 || pin == 44) return false;
+  return !(pin >= 26 && pin <= 37);
+}
+
+static void setLedPin(int pin) {
+  if (pin == ledPin) return;
+  ledWrite(ledPin, 0, 0, 0);
+  ledPin = pin;
+  lastLedRgb = 0xFFFFFFFF;
+}
+
+void ledLoop(uint32_t bootHeldMs) {
+  uint32_t now = millis();
+  bool fast = (now / 125) % 2, slow = (now / 500) % 2;
+  if (ledTestUntil && (int32_t)(ledTestUntil - now) > 0) {     // test: red, green, blue, white
+    switch (((ledTestUntil - now) / 500) % 4) {
+      case 3: led(255, 0, 0); break;
+      case 2: led(0, 255, 0); break;
+      case 1: led(0, 0, 255); break;
+      default: led(255, 255, 255);
+    }
+    return;
+  }
+  if (bootHeldMs > 5000) { led(255, 0, 0); return; }                      // forgetting Wi-Fi
+  if (bootHeldMs > 1500) { led(fast ? 255 : 0, 0, 0); return; }           // keep holding...
+  if (otaRunning) { led(fast ? 160 : 0, 0, fast ? 255 : 0); return; }     // firmware update
+  if (scanRunning) { led(255, slow ? 160 : 60, 0); return; }              // reading the battery
+  if (scanDoneAt && now - scanDoneAt < 4000) {                            // result flash
+    if (scanResultOk) led(0, 255, 0); else led(fast ? 255 : 0, 0, 0);
+    return;
+  }
+  if (!batLink.isIdle()) { led(slow ? 200 : 40, slow ? 200 : 40, slow ? 200 : 40); return; }  // PC session
+  if (unlockUntil && (int32_t)(unlockUntil - now) > 0) { led(0, slow ? 200 : 40, slow ? 200 : 40); return; }
+  if (wstate == WState::CONNECTING) { led(120, 0, 160); return; }
+  if (WiFi.status() == WL_CONNECTED && !apActive) { led(0, 70, 0); return; }
+  led(0, 0, slow ? 255 : 30);                                            // setup mode
+}
+
+// ------------------------------------------------------------------ helpers
 String jsonEsc(String v) {
   v.replace("\\", "\\\\");
   v.replace("\"", "\\\"");
   return v;
+}
+
+bool unlocked() { return unlockUntil && (int32_t)(unlockUntil - millis()) > 0; }
+
+// Requests from the setup access point count as physical presence.
+bool clientOnSetupAp() { return apActive && server.client().localIP() == WiFi.softAPIP(); }
+bool settingsAllowed() { return clientOnSetupAp() || unlocked(); }
+
+String sanitizeHost(String h) {
+  h.trim();
+  h.toLowerCase();
+  String out;
+  for (unsigned i = 0; i < h.length() && out.length() < 30; i++) {
+    char c = h[i];
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') out += c;
+  }
+  while (out.length() && out[0] == '-') out.remove(0, 1);
+  while (out.length() && out[out.length() - 1] == '-') out.remove(out.length() - 1);
+  return out;
+}
+
+const char* resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "Einschalten";
+    case ESP_RST_SW: return "Neustart (Software)";
+    case ESP_RST_PANIC: return "Absturz";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return "Watchdog";
+    case ESP_RST_BROWNOUT: return "Unterspannung (Brownout)";
+    case ESP_RST_DEEPSLEEP: return "Deep Sleep";
+    case ESP_RST_EXT: return "Reset-Taste";
+    case ESP_RST_USB: return "USB";
+    default: return "unbekannt";
+  }
 }
 
 String ipString() {
@@ -129,23 +270,28 @@ String ipString() {
   return apActive ? WiFi.softAPIP().toString() : String("");
 }
 
+// ------------------------------------------------------------------ Wi-Fi
 void loadPrefs() {
   prefs.begin("m18", true);
   savedSsid = prefs.getString("ssid", "");
   savedPass = prefs.getString("pass", "");
   hostName = prefs.getString("host", "");
+  ledPin = prefs.getInt("ledpin", DEFAULT_LED_PIN);
+  if (!ledPinAllowed(ledPin)) ledPin = DEFAULT_LED_PIN;
+  ledBright = (uint8_t)prefs.getInt("ledbright", 40);
   prefs.end();
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char suffix[8];
   snprintf(suffix, sizeof(suffix), "%02x%02x", mac[4], mac[5]);
+  hostName = sanitizeHost(hostName);
   if (hostName.isEmpty()) hostName = String("m18-bridge-") + suffix;
   String up = suffix;
   up.toUpperCase();
   apName = String("M18-Bridge-") + up;
 }
 
-void savePrefs(const String& ssid, const String& pass) {
+void saveWifi(const String& ssid, const String& pass) {
   prefs.begin("m18", false);
   prefs.putString("ssid", ssid);
   prefs.putString("pass", pass);
@@ -155,11 +301,33 @@ void savePrefs(const String& ssid, const String& pass) {
   savedPass = pass;
 }
 
+void saveLed() {
+  prefs.begin("m18", false);
+  prefs.putInt("ledpin", ledPin);
+  prefs.putInt("ledbright", ledBright);
+  prefs.end();
+}
+
+void startMdns() {
+  MDNS.end();
+  if (MDNS.begin(hostName.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("m18bridge", "tcp", 80);
+    MDNS.addServiceTxt("m18bridge", "tcp", "version", M18BRIDGE_VERSION);
+  }
+}
+
+void onWifiEvent(arduino_event_id_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) gotIp = true;   // handled in loop()
+}
+
 void startAP() {
   if (apActive) return;
   WiFi.mode(savedSsid.length() ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(apName.c_str(), AP_PASSWORD);
+  WiFi.setSleep(false);
   apActive = true;
+  dns.setErrorReplyCode(DNSReplyCode::NoError);
   dns.start(53, "*", WiFi.softAPIP());   // captive portal: every name -> us
   dnsActive = true;
   apCloseAt = 0;
@@ -173,12 +341,14 @@ void stopAP() {
   if (dnsActive) { dns.stop(); dnsActive = false; }
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   apActive = false;
   apCloseAt = 0;
 }
 
 void beginConnect(const String& ssid, const String& pass) {
   WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setSleep(false);                // no modem sleep: reliable web server + discovery
   WiFi.setHostname(hostName.c_str());
   WiFi.begin(ssid.c_str(), pass.c_str());
   wstate = WState::CONNECTING;
@@ -192,7 +362,7 @@ void onConnected() {
   WiFi.setAutoReconnect(true);
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   if (portalConnect) {                 // credentials entered on the web page: keep them now
-    savePrefs(pendSsid, pendPass);
+    saveWifi(pendSsid, pendPass);
     portalConnect = false;
   }
   if (apActive) apCloseAt = millis() + AP_CLOSE_AFTER_MS;
@@ -201,6 +371,10 @@ void onConnected() {
 }
 
 void wifiLoop() {
+  if (gotIp) {                         // new/changed IP: re-announce via mDNS
+    gotIp = false;
+    startMdns();
+  }
   wl_status_t st = WiFi.status();
   if (wstate == WState::CONNECTING) {
     if (st == WL_CONNECTED) onConnected();
@@ -246,12 +420,18 @@ const char* stateName() {
 
 void updateInfo() {
   bool sta = WiFi.status() == WL_CONNECTED;
+  int unlockS = unlocked() ? (int)((int32_t)(unlockUntil - millis()) / 1000) : 0;
   infoExtra = String("\"wifi\":\"") + (sta ? "sta" : "ap") + "\",\"ip\":\"" + ipString() +
               "\",\"host\":\"" + hostName + ".local\",\"ssid\":\"" + jsonEsc(sta ? WiFi.SSID() : savedSsid) +
               "\",\"ap\":\"" + (apActive ? apName : String("")) + "\",\"ap_ip\":\"" +
               (apActive ? WiFi.softAPIP().toString() : String("")) + "\",\"rssi\":" + String(sta ? WiFi.RSSI() : 0) +
               ",\"mac\":\"" + WiFi.macAddress() + "\",\"uptime_s\":" + String(millis() / 1000) +
-              ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) + ",\"psram_kb\":" + String(ESP.getFreePsram() / 1024);
+              ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) + ",\"min_heap_kb\":" + String(ESP.getMinFreeHeap() / 1024) +
+              ",\"psram_kb\":" + String(ESP.getFreePsram() / 1024) + ",\"reset_reason\":\"" + resetReason() +
+              "\",\"build\":\"" FW_BUILD "\",\"led_pin\":" + String(ledPin) + ",\"led_brightness\":" + String(ledBright) +
+              ",\"unlocked\":" + (unlocked() ? "true" : "false") + ",\"unlock_s\":" + String(unlockS) +
+              ",\"setup_client\":" + (clientOnSetupAp() ? "true" : "false") +
+              ",\"reading\":" + (scanRunning ? "true" : "false");
   uint32_t now = unixNow();
   if (now) {
     char b[32];
@@ -265,49 +445,97 @@ void updateInfo() {
 }
 
 // ------------------------------------------------------------- commands
-String runCommand(const String& lineIn) {
+static bool isBatteryCommand(const String& up) {
+  return up.startsWith("RESET") || up.startsWith("IDLE") || up.startsWith("HIGH") || up.startsWith("READ") ||
+         up.startsWith("NOTE") || up.startsWith("SCAN");
+}
+
+String runCommand(const String& lineIn, bool physical) {
   String line = lineIn;
   line.trim();
   String up = line;
   up.toUpperCase();
-  if (up.startsWith("WIFI ")) {                 // WIFI <ssid>|<password>  or  WIFI OFF
-    String rest = line.substring(5);
-    if (rest.equalsIgnoreCase("OFF")) savePrefs("", "");
-    else {
-      int bar = rest.indexOf('|');
-      savePrefs(bar < 0 ? rest : rest.substring(0, bar), bar < 0 ? "" : rest.substring(bar + 1));
+  if (up.startsWith("WIFI ") || up.startsWith("HOST ")) {
+    if (!physical) return "ERR LOCKED (nur über USB, Einrichtungs-WLAN oder nach BOOT-Tastendruck)";
+    if (up.startsWith("HOST ")) {
+      String h = sanitizeHost(line.substring(5));
+      if (h.isEmpty()) return "ERR HOST (a-z, 0-9, -)";
+      hostName = h;
+      saveWifi(savedSsid, savedPass);
+      return "OK saved, restart with RESTART";
     }
-    return "OK saved, restart with RESTART";
-  }
-  if (up.startsWith("HOST ")) {
-    hostName = line.substring(5);
-    savePrefs(savedSsid, savedPass);
+    String rest = line.substring(5);
+    if (rest.equalsIgnoreCase("OFF")) { saveWifi("", ""); return "OK saved, restart with RESTART"; }
+    int bar = rest.indexOf('|');
+    String ssid = bar < 0 ? rest : rest.substring(0, bar), pass = bar < 0 ? String("") : rest.substring(bar + 1);
+    if (ssid.isEmpty() || ssid.length() > 32) return "ERR SSID (1-32 Zeichen)";
+    if (pass.length() && (pass.length() < 8 || pass.length() > 63)) return "ERR PASSWORD (8-63 Zeichen)";
+    saveWifi(ssid, pass);
     return "OK saved, restart with RESTART";
   }
   if (up == "RESTART") {
+    if (!physical) return "ERR LOCKED";
     Serial.println("OK restarting");
     delay(200);
     ESP.restart();
     return "OK";
   }
   updateInfo();
-  bool scan = (up == "SCAN");
-  if (scan) led(20, 14, 0);                     // yellow while reading
+  bool battery = isBatteryCommand(up);
+  if (battery && !lockBattery(BUSY_WAIT_MS)) return "ERR BUSY (Akku wird gerade ausgelesen)";
+  bool scan = up.startsWith("SCAN");
+  if (scan) scanRunning = true;
   proc.handle(line.c_str(), replyBuf, sizeof(replyBuf));
   if (scan) {
     const char* json = strchr(replyBuf, '{');
-    lastScan = json ? String(json) : String("{}");
+    String result = json ? String(json) : String("{}");
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    lastScan = result;
+    xSemaphoreGive(stateMutex);
+    scanResultOk = reader.ok();
+    scanDoneAt = millis();
+    scanRunning = false;
   }
+  if (battery) unlockBattery();
   return String(replyBuf);
 }
 
+// Web read-out runs in its own task so the web server, LED and USB stay responsive.
+static char scanJson[2400];
+void scanTask(void*) {
+  if (lockBattery(BUSY_WAIT_MS)) {
+    reader.read();
+    reader.toJson(scanJson, sizeof(scanJson), unixNow());
+    unlockBattery();
+  } else {
+    snprintf(scanJson, sizeof(scanJson), "{\"ok\":false,\"error\":\"Akku-Leitung belegt (PC liest gerade)\"}");
+  }
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  lastScan = scanJson;
+  xSemaphoreGive(stateMutex);
+  scanResultOk = reader.ok();
+  scanDoneAt = millis();
+  scanRunning = false;
+  vTaskDelete(nullptr);
+}
+
+bool startScan() {
+  if (scanRunning || otaRunning) return false;
+  scanRunning = true;
+  if (xTaskCreatePinnedToCore(scanTask, "m18scan", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+    scanRunning = false;
+    return false;
+  }
+  return true;
+}
+
 // ------------------------------------------------------------------- HTTP
-void sendJson(const String& s) { server.send(200, "application/json", s); }
+void sendJson(const String& s, int code = 200) { server.send(code, "application/json", s); }
 
 bool captiveRedirect() {
   // Phones probe random URLs when joining the setup AP; send them to our page.
   // Only for clients on the setup AP - not for the customer's network.
-  if (!apActive || server.client().localIP() != WiFi.softAPIP()) return false;
+  if (!clientOnSetupAp()) return false;
   String host = server.hostHeader();
   if (host == WiFi.softAPIP().toString() || host == hostName + ".local") return false;
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
@@ -315,23 +543,33 @@ bool captiveRedirect() {
   return true;
 }
 
+bool requireSettings() {
+  if (settingsAllowed()) return true;
+  sendJson("{\"ok\":false,\"locked\":true,\"error\":\"Gesperrt: kurz die BOOT-Taste am Gerät drücken "
+           "(entsperrt 2 Minuten) oder über das Einrichtungs-WLAN ändern.\"}", 403);
+  return false;
+}
+
 void setupHttp() {
   server.on("/", HTTP_GET, []() {
     if (captiveRedirect()) return;
+    server.sendHeader("Cache-Control", "no-store");
     server.send_P(200, "text/html; charset=utf-8", WEB_UI);
   });
   server.on("/cmd", HTTP_POST, []() {
     String body = server.arg("plain"), out;
+    if (body.length() > MAX_CMD_BODY) { server.send(413, "text/plain", "ERR TOO LARGE\n"); return; }
+    bool physical = settingsAllowed();
     int start = 0, count = 0;
     while (start <= (int)body.length() && count < 400) {
       int nl = body.indexOf('\n', start);
       if (nl < 0) nl = body.length();
       String line = body.substring(start, nl);
       line.trim();
-      if (line.length()) { out += runCommand(line); out += '\n'; count++; }
+      if (line.length()) { out += runCommand(line, physical); out += '\n'; count++; }
       start = nl + 1;
     }
-    server.send(200, "text/plain", out);
+    server.send(200, "text/plain; charset=utf-8", out);
   });
   server.on("/api/info", HTTP_GET, []() {
     updateInfo();
@@ -339,23 +577,36 @@ void setupHttp() {
     sendJson(String(replyBuf + 3));
   });
   server.on("/api/read", HTTP_POST, []() {
-    String r = runCommand("SCAN");
-    int brace = r.indexOf('{');
-    sendJson(brace >= 0 ? r.substring(brace) : String("{\"ok\":false}"));
+    if (startScan()) sendJson("{\"ok\":true,\"started\":true}");
+    else sendJson("{\"ok\":false,\"busy\":true}", 409);
   });
-  server.on("/api/last", HTTP_GET, []() { sendJson(lastScan); });
+  server.on("/api/status", HTTP_GET, []() {
+    sendJson(String("{\"reading\":") + (scanRunning ? "true" : "false") + ",\"progress\":" +
+             String(scanRunning ? reader.progressPercent() : 100) + ",\"done_ms_ago\":" +
+             String(scanDoneAt ? millis() - scanDoneAt : 0) + "}");
+  });
+  server.on("/api/last", HTTP_GET, []() {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    String copy = lastScan;
+    xSemaphoreGive(stateMutex);
+    sendJson(copy);
+  });
   server.on("/api/networks", HTTP_GET, []() {
-    int n = WiFi.scanNetworks(false, false);
-    String out = "[";
-    for (int i = 0; i < n && i < 25; i++) {
+    // Asynchronous scan: first call starts it, the page polls until the list is ready.
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); sendJson("{\"scanning\":true}"); return; }
+    if (n == WIFI_SCAN_RUNNING) { sendJson("{\"scanning\":true}"); return; }
+    String out = "{\"scanning\":false,\"networks\":[";
+    int shown = 0;
+    for (int i = 0; i < n && shown < 25; i++) {
       String ssid = WiFi.SSID(i);
       if (ssid.isEmpty()) continue;
-      if (out.length() > 1) out += ",";
+      if (shown++) out += ",";
       out += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
              ",\"secure\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "false" : "true") + "}";
     }
     WiFi.scanDelete();
-    sendJson(out + "]");
+    sendJson(out + "]}");
   });
   server.on("/api/wifi", HTTP_GET, []() {
     bool sta = WiFi.status() == WL_CONNECTED;
@@ -364,28 +615,81 @@ void setupHttp() {
              jsonEsc(portalConnect || wstate == WState::FAILED ? pendSsid : (sta ? WiFi.SSID() : savedSsid)) +
              "\",\"ip\":\"" + (sta ? WiFi.localIP().toString() : String("")) + "\",\"host\":\"" + hostName +
              ".local\",\"rssi\":" + String(sta ? WiFi.RSSI() : 0) + ",\"ap\":\"" + apName +
-             "\",\"ap_closes_in\":" + String(closesIn > 0 ? closesIn : 0) + ",\"error\":\"" + wifiError + "\"}");
+             "\",\"ap_closes_in\":" + String(closesIn > 0 ? closesIn : 0) + ",\"error\":\"" + jsonEsc(wifiError) +
+             "\",\"allowed\":" + (settingsAllowed() ? "true" : "false") + "}");
   });
   server.on("/api/wifi", HTTP_POST, []() {
-    pendSsid = server.arg("ssid");
-    pendPass = server.arg("pass");
-    String h = server.arg("host");
-    h.trim();
+    if (!requireSettings()) return;
+    String ssid = server.arg("ssid"), pass = server.arg("pass"), h = sanitizeHost(server.arg("host"));
+    if (ssid.isEmpty() || ssid.length() > 32) { sendJson("{\"ok\":false,\"error\":\"SSID ungültig\"}", 400); return; }
+    if (pass.length() && (pass.length() < 8 || pass.length() > 63)) {
+      sendJson("{\"ok\":false,\"error\":\"Passwort muss 8–63 Zeichen haben (oder leer für offenes WLAN)\"}", 400);
+      return;
+    }
+    pendSsid = ssid;
+    pendPass = pass;
     if (h.length()) hostName = h;
     portalConnect = true;
     if (!apActive && WiFi.status() != WL_CONNECTED) startAP();
     beginConnect(pendSsid, pendPass);
-    MDNS.end();                                   // re-announce with the (possibly) new name
-    MDNS.begin(hostName.c_str());
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addService("m18bridge", "tcp", 80);
+    startMdns();                                  // re-announce with the (possibly) new name
     sendJson("{\"ok\":true}");
   });
   server.on("/api/wifi/forget", HTTP_POST, []() {
-    savePrefs("", "");
+    if (!requireSettings()) return;
+    saveWifi("", "");
     sendJson("{\"ok\":true}");
     delay(500);
     ESP.restart();
+  });
+  server.on("/api/led", HTTP_POST, []() {
+    if (server.hasArg("pin")) {
+      int pin = server.arg("pin").toInt();
+      if (!ledPinAllowed(pin)) {
+        sendJson("{\"ok\":false,\"error\":\"Pin nicht erlaubt\"}", 400);
+        return;
+      }
+      setLedPin(pin);
+    }
+    if (server.hasArg("brightness")) ledBright = (uint8_t)constrain(server.arg("brightness").toInt(), 0, 255);
+    lastLedRgb = 0xFFFFFFFF;
+    saveLed();
+    sendJson("{\"ok\":true}");
+  });
+  server.on("/api/led/test", HTTP_POST, []() {
+    if (server.hasArg("pin")) {
+      int pin = server.arg("pin").toInt();
+      if (ledPinAllowed(pin)) setLedPin(pin);
+    }
+    ledTestUntil = millis() + 2000;
+    sendJson("{\"ok\":true}");
+  });
+  // Firmware update (.bin from Arduino IDE "Sketch > Export Compiled Binary").
+  server.on("/api/update", HTTP_POST, []() {
+    if (!settingsAllowed()) { requireSettings(); return; }
+    bool ok = !Update.hasError();
+    sendJson(ok ? String("{\"ok\":true}") : String("{\"ok\":false,\"error\":\"") + jsonEsc(Update.errorString()) + "\"}",
+             ok ? 200 : 500);
+    otaRunning = false;
+    if (ok) { delay(800); ESP.restart(); }
+  }, []() {
+    HTTPUpload& up = server.upload();
+    if (!settingsAllowed()) return;
+    if (up.status == UPLOAD_FILE_START) {
+      if (scanRunning || !lockBattery(2000)) { Update.abort(); return; }
+      batLink.idle();                              // J2 low during the update
+      unlockBattery();
+      otaRunning = true;
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+      if (Update.isRunning()) Update.write(up.buf, up.currentSize);
+      feedWdt();
+    } else if (up.status == UPLOAD_FILE_END) {
+      if (Update.isRunning()) Update.end(true);
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+      Update.abort();
+      otaRunning = false;
+    }
   });
   server.onNotFound([]() {
     if (captiveRedirect()) return;
@@ -413,20 +717,27 @@ void discoveryLoop() {
 struct LineInput {
   Stream* s;
   String buf;
+  bool overflow;
   void poll() {
-    while (s->available()) {
+    int budget = 256;                            // never starve the rest of loop()
+    while (budget-- > 0 && s->available()) {
       char ch = (char)s->read();
       if (ch == '\n' || ch == '\r') {
-        if (buf.length()) { s->println(runCommand(buf)); buf = ""; }
+        if (overflow) s->println("ERR TOOLONG");
+        else if (buf.length()) s->println(runCommand(buf, true));   // USB = physical access
+        buf = "";
+        overflow = false;
       } else if (buf.length() < 120) {
         buf += ch;
+      } else {
+        overflow = true;
       }
     }
   }
 };
-LineInput usbIn{&Serial, ""};
+LineInput usbIn{&Serial, "", false};
 #if ARDUINO_USB_CDC_ON_BOOT
-LineInput uartIn{&Serial0, ""};                 // second USB socket ("UART", CH343/CP2102)
+LineInput uartIn{&Serial0, "", false};          // second USB socket ("UART", CH343/CP2102)
 #endif
 
 // --------------------------------------------------------------------- main
@@ -435,15 +746,23 @@ uint32_t bootPressedSince = 0;
 void setup() {
   port.begin();                                 // J2 low first - before anything else
   pinMode(PIN_BOOT, INPUT_PULLUP);
-  led(0, 0, 8);
+  batMutex = xSemaphoreCreateMutex();
+  stateMutex = xSemaphoreCreateMutex();
+  loopTaskHandle = xTaskGetCurrentTaskHandle();
+
   Serial.begin(HOST_BAUD);
 #if ARDUINO_USB_CDC_ON_BOOT
   Serial0.begin(HOST_BAUD);
+#if ARDUINO_USB_MODE
+  Serial.setTxTimeoutMs(0);                     // never block when no PC listens on native USB
+#endif
 #endif
   proc.setClock(unixNow);
 
   WiFi.persistent(false);
+  WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   loadPrefs();
+  led(0, 0, 255);
   WiFi.setHostname(hostName.c_str());
   if (savedSsid.length()) {
     WiFi.mode(WIFI_STA);
@@ -460,15 +779,12 @@ void setup() {
     startAP();
     lastStaRetry = millis();
   }
-
-  if (MDNS.begin(hostName.c_str())) {
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addService("m18bridge", "tcp", 80);
-    MDNS.addServiceTxt("m18bridge", "tcp", "version", M18BRIDGE_VERSION);
-  }
+  startMdns();
   disc.begin(DISCOVERY_PORT);
   setupHttp();
-  Serial.printf("\nM18BRIDGE READY %s host=%s.local ip=%s\n", M18BRIDGE_VERSION, hostName.c_str(), ipString().c_str());
+  enableLoopWDT();                              // loop() must come back within the watchdog timeout
+  Serial.printf("\nM18BRIDGE READY %s host=%s.local ip=%s reset=%s\n", M18BRIDGE_VERSION, hostName.c_str(),
+                ipString().c_str(), resetReason());
 }
 
 void loop() {
@@ -482,29 +798,40 @@ void loop() {
   wifiLoop();
 
   // Safety: never leave J2 high when the PC went away mid-session.
-  if (!batLink.isIdle() && millis() - batLink.lastActivity() > AUTO_IDLE_MS) batLink.idle();
+  if (!scanRunning && xSemaphoreTake(batMutex, 0) == pdTRUE) {
+    if (!batLink.isIdle() && millis() - batLink.lastActivity() > AUTO_IDLE_MS) batLink.idle();
+    xSemaphoreGive(batMutex);
+  }
 
-  // BOOT button held 5 s: forget Wi-Fi and restart in setup mode.
+  // BOOT button: short press unlocks settings for 2 min, hold 5 s forgets Wi-Fi.
+  uint32_t held = 0;
   if (digitalRead(PIN_BOOT) == LOW) {
     if (!bootPressedSince) bootPressedSince = millis();
-    if (millis() - bootPressedSince > 5000) {
-      led(30, 0, 0);
-      savePrefs("", "");
+    held = millis() - bootPressedSince;
+    if (held > 5000) {
+      led(255, 0, 0);
+      saveWifi("", "");
       delay(300);
       ESP.restart();
     }
-  } else {
+  } else if (bootPressedSince) {
+    uint32_t pressed = millis() - bootPressedSince;
     bootPressedSince = 0;
+    if (pressed > 50 && pressed < 1500) {
+      unlockUntil = millis() + UNLOCK_MS;
+      Serial.println("Einstellungen 2 Minuten entsperrt");
+    }
   }
 
-  // LED: green = in Wi-Fi, blue = setup mode, purple = connecting, white blink = battery line active
-  static uint32_t lastLed = 0;
-  if (millis() - lastLed > 250) {
-    lastLed = millis();
-    bool blink = (millis() / 250) % 2;
-    if (!batLink.isIdle()) led(blink ? 12 : 0, blink ? 12 : 0, blink ? 12 : 0);
-    else if (wstate == WState::CONNECTING) led(8, 0, 10);
-    else if (WiFi.status() == WL_CONNECTED) led(0, 8, 0);
-    else led(0, 0, blink ? 10 : 2);
+  // Heap guard: restart cleanly (when idle) instead of failing in odd ways.
+  if (ESP.getFreeHeap() < LOW_HEAP_BYTES) {
+    if (!lowHeapSince) lowHeapSince = millis();
+    if (millis() - lowHeapSince > 10000 && !scanRunning && !otaRunning && batLink.isIdle()) ESP.restart();
+  } else {
+    lowHeapSince = 0;
   }
+
+  static uint32_t lastLed = 0;
+  if (millis() - lastLed > 40) { lastLed = millis(); ledLoop(held); }
+  delay(1);                                     // let lower-priority tasks (Wi-Fi, idle) run
 }

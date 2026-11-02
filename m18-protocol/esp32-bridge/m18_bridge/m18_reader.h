@@ -78,25 +78,58 @@ class Reader {
   explicit Reader(Link& link, Port& port) : link_(link), port_(port) {}
 
   // Full read like m18.py read_id(): dummy pass, idle, reset, real pass, idle.
+  // Hardened: several reset attempts, one retry + resync per block, abort as soon
+  // as the battery stops answering (unplugged) instead of waiting for every timeout.
   // Returns the number of blocks that answered in the real pass.
   int read() {
     mem_.clear();
     uint32_t t0 = port_.millis();
     uint8_t buf[MAX_FRAME];
     ok_ = false;
-    if (!link_.reset(nullptr)) { link_.idle(); durationMs_ = port_.millis() - t0; answered_ = 0; return 0; }
-    for (int i = 0; i < NUM_BLOCKS; i++) readBlock(BLOCKS[i], buf, false);
+    answered_ = 0;
+    retries_ = 0;
+    cksumMismatch_ = 0;
+    error_ = nullptr;
+    progress_ = 0;
+    if (!resetWithRetry()) {
+      fail("Akku antwortet nicht (kein Sync) – Akku aufgesteckt, Verkabelung J1/J2/B- ok?", t0);
+      return 0;
+    }
+    int fails = 0;
+    for (int i = 0; i < NUM_BLOCKS; i++) {           // dummy pass: refreshes the 0x9000 RAM copy
+      fails = readBlock(BLOCKS[i], buf, false) ? 0 : fails + 1;
+      progress_++;
+      if (fails >= ABORT_AFTER_FAILS) { fail("Verbindung zum Akku abgebrochen", t0); return 0; }
+    }
     link_.idle();
     port_.delayMs(100);
-    answered_ = 0;
-    if (link_.reset(nullptr)) {
-      for (int i = 0; i < NUM_BLOCKS; i++) answered_ += readBlock(BLOCKS[i], buf, true) ? 1 : 0;
+    if (!resetWithRetry()) { fail("Akku antwortet nach dem ersten Durchlauf nicht mehr", t0); return 0; }
+    fails = 0;
+    for (int i = 0; i < NUM_BLOCKS; i++) {
+      bool okb = readBlock(BLOCKS[i], buf, true);
+      if (!okb) {                                     // retry once, then resync with a reset
+        retries_++;
+        port_.delayMs(40);
+        okb = readBlock(BLOCKS[i], buf, true);
+        if (!okb) {
+          if (!resetWithRetry(2)) { fail("Verbindung zum Akku abgebrochen", t0); return answered_; }
+          retries_++;
+          okb = readBlock(BLOCKS[i], buf, true);
+        }
+      }
+      progress_++;
+      if (okb) { answered_++; fails = 0; }
+      else if (++fails >= ABORT_AFTER_FAILS) { fail("Verbindung zum Akku abgebrochen", t0); return answered_; }
     }
     link_.idle();
     durationMs_ = port_.millis() - t0;
     ok_ = mem_.has(0x0004, 5);
+    if (!ok_) error_ = "Seriennummer nicht lesbar";
     return answered_;
   }
+
+  // Progress of a running read() in percent (safe to poll from another task).
+  int progressPercent() const { return progress_ * 100 / (2 * NUM_BLOCKS); }
 
   bool ok() const { return ok_; }
   const Memory& memory() const { return mem_; }
@@ -107,7 +140,8 @@ class Reader {
     j.raw("{");
     j.kv("ok", ok_);
     j.kvn("blocks_ok", answered_); j.kvn("blocks_total", NUM_BLOCKS); j.kvn("duration_ms", durationMs_);
-    if (!ok_) { j.kvs("error", answered_ ? "Seriennummer nicht lesbar" : "Akku antwortet nicht", false); j.raw("}"); return j.len(); }
+    j.kvn("retries", retries_); j.kvn("checksum_mismatch", cksumMismatch_);
+    if (!ok_) { j.kvs("error", error_ ? error_ : "Akku antwortet nicht", false); j.raw("}"); return j.len(); }
 
     uint16_t type = (uint16_t)mem_.be(0x0004, 2);
     uint32_t serial = mem_.be(0x0006, 3);
@@ -148,6 +182,19 @@ class Reader {
         ncell++;
       }
     }
+    // Plausibility: Li-ion cells are 2.0-4.4 V; anything else means a bad read or a broken pack.
+    bool cellsPlausible = ncell == 5;
+    for (int i = 0; i < ncell; i++) if (cells[i] < 2000 || cells[i] > 4400) cellsPlausible = false;
+    j.key("warnings"); j.raw("[");
+    bool firstW = true;
+    auto warn = [&](const char* w) { if (!firstW) j.raw(","); firstW = false; j.str(w); };
+    if (!cellsPlausible) warn("Zellspannungen unplausibel – Messung wiederholen");
+    if (answered_ < NUM_BLOCKS) warn("Nicht alle Registerblöcke gelesen");
+    if (cksumMismatch_) warn("Prüfsummen-Abweichungen – Verkabelung/Störungen prüfen");
+    for (int i = 0; i < ncell; i++) if (cells[i] >= 2000 && cells[i] < 2500) { warn("Zelle unter 2,5 V – tiefentladen"); break; }
+    if (u(0x902E, 2) > 0) warn("Wurde schon mit einer Zelle < 2,5 V geladen");
+    if (ncell && hi - lo >= 100) warn("Zell-Imbalance >= 100 mV");
+    j.raw("],");
     j.key("cells_mv"); j.raw("[");
     for (int i = 0; i < ncell; i++) { char b[12]; snprintf(b, sizeof(b), "%s%d", i ? "," : "", cells[i]); j.raw(b); }
     j.raw("],");
@@ -221,10 +268,34 @@ class Reader {
   }
 
  private:
+  static const int ABORT_AFTER_FAILS = 3;
+
+  bool resetWithRetry(int attempts = 3) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
+      if (link_.reset(nullptr)) return true;
+      link_.idle();
+      port_.delayMs(250);
+    }
+    return false;
+  }
+
+  void fail(const char* why, uint32_t t0) {
+    link_.idle();
+    error_ = why;
+    ok_ = false;
+    durationMs_ = port_.millis() - t0;
+  }
+
   bool readBlock(const Block& b, uint8_t* buf, bool store) {
+    size_t want = (size_t)b.len + 5;
     size_t n = link_.command(0x01, 0x04, 0x03, (uint8_t)(b.addr >> 8), (uint8_t)b.addr, b.len,
-                             buf, (size_t)b.len + 5, MAX_FRAME);
-    if (n < (size_t)b.len + 3 || buf[0] != 0x81) return false;
+                             buf, want, MAX_FRAME);
+    if (n < (size_t)b.len + 3 || buf[0] != 0x81) return false;      // too short / error reply
+    if (n == want) {                                                  // full frame: check the sum
+      uint16_t sum = 0;
+      for (size_t i = 0; i < n - 2; i++) sum += buf[i];
+      if (((sum >> 8) & 0xFF) != buf[n - 2] || (sum & 0xFF) != buf[n - 1]) cksumMismatch_++;
+    }
     if (store) mem_.store(b.addr, buf + 3, b.len);
     return true;
   }
@@ -295,6 +366,10 @@ class Reader {
   Memory mem_;
   bool ok_ = false;
   int answered_ = 0;
+  int retries_ = 0;
+  int cksumMismatch_ = 0;
+  volatile int progress_ = 0;
+  const char* error_ = nullptr;
   uint32_t durationMs_ = 0;
 };
 

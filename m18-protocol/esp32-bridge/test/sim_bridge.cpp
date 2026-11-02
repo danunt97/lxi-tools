@@ -24,6 +24,11 @@ class SimBattery : public m18::Port {
  public:
   bool present = true;
   bool idle = true;
+  // fault injection
+  int dropEvery = 0;      // swallow every n-th command reply
+  int failResets = 0;     // ignore the first n sync bytes
+  int dieAfter = 0;       // battery "unplugged" after n commands
+  int commands = 0;
   uint32_t clock = 0;
   std::map<uint16_t, uint8_t> mem;
   std::deque<uint8_t> rx;   // bytes travelling battery -> bridge (already reversed on the wire)
@@ -53,8 +58,15 @@ class SimBattery : public m18::Port {
     if (idle || !present) return;                 // TX held low: nothing reaches the pack
     std::vector<uint8_t> p;
     for (size_t i = 0; i < n; i++) p.push_back(rev8(d[i]));
-    if (p.size() == 1 && p[0] == 0xAA) { reply({0xAA}); return; }
+    if (p.size() == 1 && p[0] == 0xAA) {
+      if (failResets > 0) { failResets--; return; }
+      reply({0xAA});
+      return;
+    }
     if (p.size() != 8) return;
+    commands++;
+    if (dieAfter && commands >= dieAfter) { present = false; return; }
+    if (dropEvery && commands % dropEvery == 0) return;
     uint16_t sum = 0;
     for (int i = 0; i < 6; i++) sum += p[i];
     if (((sum >> 8) & 0xFF) != p[6] || (sum & 0xFF) != p[7]) { reply({0x82, 0x01}); return; }
@@ -135,6 +147,39 @@ int selftest() {
     expect(scan.find(want) != std::string::npos ? want : scan.substr(0, 40), want);
   }
   expect(bat.idle ? "idle" : "high", "idle");                            // SCAN leaves J2 low
+
+  {  // flaky line: lost replies and ignored resets are recovered by retries
+    SimBattery b2;
+    b2.dropEvery = 7;
+    b2.failResets = 2;
+    m18::Link l2(b2);
+    m18::Reader r2(l2, b2);
+    m18::CommandProcessor p2(l2, r2);
+    std::string sc = run(p2, "SCAN");
+    expect(sc.find("\"blocks_ok\":32,") != std::string::npos ? "flaky: 32/32" : sc.substr(0, 90), "flaky: 32/32");
+    expect(sc.find("\"retries\":0,") == std::string::npos ? "flaky: retried" : "no retries", "flaky: retried");
+    expect(sc.rfind("OK {", 0) == 0 ? "flaky: OK" : sc.substr(0, 60), "flaky: OK");
+  }
+  {  // battery pulled mid-read: quick abort with a clear error
+    SimBattery b3;
+    b3.dieAfter = 45;
+    m18::Link l3(b3);
+    m18::Reader r3(l3, b3);
+    m18::CommandProcessor p3(l3, r3);
+    std::string sc = run(p3, "SCAN");
+    expect(sc.find("Verbindung zum Akku abgebrochen") != std::string::npos ? "unplug: error" : sc.substr(0, 120), "unplug: error");
+    expect(b3.clock < 15000 ? "unplug: fast" : "unplug: slow " + std::to_string(b3.clock), "unplug: fast");
+    expect(b3.idle ? "idle" : "high", "idle");
+  }
+  {  // implausible cell voltages are flagged
+    SimBattery b4;
+    b4.mem[0x400A] = 0x00; b4.mem[0x400B] = 0x00;     // cell 1 = 0 mV
+    m18::Link l4(b4);
+    m18::Reader r4(l4, b4);
+    m18::CommandProcessor p4(l4, r4);
+    std::string sc = run(p4, "SCAN");
+    expect(sc.find("Zellspannungen unplausibel") != std::string::npos ? "plausibility" : sc.substr(0, 80), "plausibility");
+  }
   bat.present = false;                                                   // battery unplugged
   expect(run(p, "SCAN"), "ERR {\"ok\":false,\"blocks_ok\":0", true);
   expect(run(p, "RESET"), "ERR NOACK");
