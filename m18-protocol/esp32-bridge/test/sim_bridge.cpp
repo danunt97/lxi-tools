@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "m18_proto.h"
+#include "m18_commands.h"
 
 using m18::rev8;
 
@@ -41,6 +41,9 @@ class SimBattery : public m18::Port {
     put(0x9012, {0x00, 0x36, 0xEE, 0x80});                        // 3,600,000 As
     put(0x901A, {0x00, 0x00, 0x01, 0x04});                        // 260 charges
     put(0x9032, {0x00, 0x02});                                    // 2 overheats
+    put(0x9036, {0x00, 0x06});                                    // 6 low-voltage events
+    put(0x0037, {0x69, 0x05, 0x4D, 0x80});                        // battery clock 2025-11-01
+    put(0x903A, {0x0E, 0x10, 0x07, 0x08});                        // 3600 s @10-20A, 1800 s @20-30A
   }
 
   // --- m18::Port
@@ -86,7 +89,7 @@ class SimBattery : public m18::Port {
 };
 
 static std::string run(m18::CommandProcessor& p, const char* line) {
-  char buf[200];
+  static char buf[2048];
   p.handle(line, buf, sizeof(buf));
   return buf;
 }
@@ -102,7 +105,8 @@ int selftest() {
   assert(rev8(0x01) == 0x80 && rev8(0xAA) == 0x55 && rev8(0x81) == 0x81 && rev8(0x82) == 0x41);
   SimBattery bat;
   m18::Link link(bat);
-  m18::CommandProcessor p(link);
+  m18::Reader reader(link, bat);
+  m18::CommandProcessor p(link, reader);
   expect(run(p, "ping"), "OK M18BRIDGE " M18BRIDGE_VERSION);
   expect(run(p, "READ 0x400A 10"), "ERR IDLE", true);                  // must RESET first
   expect(run(p, "RESET"), "OK ACK");
@@ -118,7 +122,21 @@ int selftest() {
   expect(run(p, "IDLE"), "OK");
   expect(bat.idle ? "idle" : "high", "idle");
   expect(run(p, "INFO"), "OK {\"version\":\"" M18BRIDGE_VERSION "\",\"line\":\"idle\"}");
+  // direct read-out on the bridge
+  std::string scan = run(p, "SCAN");
+  std::printf("      %s\n", scan.c_str());
+  for (const char* want : {"OK {\"ok\":true", "\"blocks_ok\":32,\"blocks_total\":32", "\"eserial\":\"306-412877\"",
+                           "\"model\":\"5Ah XC (2021-2023)\"", "\"manufactured\":\"2022-03-14\"",
+                           "\"battery_date\":\"2025-11-01\"", "\"note\":\"B-07\"",
+                           "\"cells_mv\":[4012,4010,4015,4009,4011]", "\"pack_v\":20.06", "\"imbalance_mv\":6",
+                           "\"temp_c\":23.0", "\"total_charges\":260", "\"overheat\":2", "\"lowvolt\":6",
+                           "\"tool_time_s\":5400", "\"discharge_ah\":1000.0", "\"cycles\":200.0",
+                           "\"health\":82", "\"status\":\"good\"", "\"label\":\"Kalenderalter\""}) {
+    expect(scan.find(want) != std::string::npos ? want : scan.substr(0, 40), want);
+  }
+  expect(bat.idle ? "idle" : "high", "idle");                            // SCAN leaves J2 low
   bat.present = false;                                                   // battery unplugged
+  expect(run(p, "SCAN"), "ERR {\"ok\":false,\"blocks_ok\":0", true);
   expect(run(p, "RESET"), "ERR NOACK");
   expect(run(p, "READ 0x400A 10"), "ERR TIMEOUT");
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
@@ -128,7 +146,8 @@ int selftest() {
 int serve() {
   SimBattery bat;
   m18::Link link(bat);
-  m18::CommandProcessor p(link);
+  m18::Reader reader(link, bat);
+  m18::CommandProcessor p(link, reader);
   std::printf("M18BRIDGE READY %s wifi=off ip=\n", M18BRIDGE_VERSION);
   std::fflush(stdout);
   std::string line;

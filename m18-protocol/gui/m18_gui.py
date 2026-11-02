@@ -38,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PARENT = os.path.dirname(HERE)
 STATIC = os.path.join(HERE, "static")
 sys.path.insert(0, HERE)
+sys.path.insert(1, PARENT)  # m18.py, m18_bridge.py
 
 import fleet  # noqa: E402
 from fleet import FleetDB, iso, utcnow  # noqa: E402
@@ -158,8 +159,10 @@ class Hardware:
         except ImportError:
             self.log("pyserial fehlt – bitte 'pip install pyserial' ausführen")
             return []
+        import m18_bridge
         return [{"device": p.device,
-                 "desc": f"{p.manufacturer or ''} {p.description or ''}".strip()}
+                 "desc": f"{p.manufacturer or ''} {p.description or ''}".strip(),
+                 "esp": m18_bridge.is_bridge_usb_port(p)}
                 for p in list_ports.comports()]
 
     def connect(self, port):
@@ -600,6 +603,11 @@ class Handler(BaseHTTPRequestHandler):
             if r == ["resolve"]:
                 b = db.resolve(qs.get("q", [""])[0])
                 return self._send(200, {"battery": b})
+            if r == ["discover"]:
+                if app.demo:
+                    return self._send(200, {"bridges": []})
+                import m18_bridge
+                return self._send(200, {"bridges": m18_bridge.discover()})
             if r == ["demo"]:
                 if not app.demo:
                     return self._send(200, {"demo": False})

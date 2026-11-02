@@ -379,8 +379,10 @@ async function viewRead() {
           <option value="direct">USB-Seriell-Adapter</option>
           <option value="esp">ESP32-Brücke (USB)</option>
           <option value="wifi">ESP32-Brücke (WLAN)</option></select>
-          <input id="host" placeholder="m18-bridge.local oder IP" style="width:220px" hidden>`}
-        <select id="port">${(ports.ports || []).map((p) => `<option value="${h(p.device)}" ${p.device === st.port ? "selected" : ""}>${h(p.device)}${p.desc ? " – " + h(p.desc) : ""}</option>`).join("") || '<option value="">(keine seriellen Ports gefunden)</option>'}</select>
+          <input id="host" placeholder="m18-bridge-xxxx.local oder IP" style="width:220px" hidden>
+          <button class="btn" id="discover" hidden title="ESP32-Brücken im WLAN suchen">Suchen</button>
+          <select id="found" hidden></select>`}
+        <select id="port">${(ports.ports || []).map((p) => `<option value="${h(p.device)}" data-esp="${p.esp ? 1 : ""}" ${p.device === st.port || "esp:" + p.device === st.port ? "selected" : ""}>${h(p.device)}${p.esp ? " – ESP32-S3 (M18-Brücke)" : p.desc ? " – " + h(p.desc) : ""}</option>`).join("") || '<option value="">(keine seriellen Ports gefunden)</option>'}</select>
         <button class="btn" id="rescan" title="Ports neu suchen">⟳</button>
         <button class="btn ${st.connected ? "" : "primary"}" id="connect">${st.connected ? "Trennen" : "Verbinden"}</button>
         <button class="btn ghost" id="idle" ${st.connected ? "" : "disabled"} title="TX auf Low setzen (Akku schlafen lassen)">Idle</button>
@@ -426,14 +428,37 @@ async function viewRead() {
     $("#host").hidden = !wifi;
     $("#port").hidden = wifi;
     $("#rescan").hidden = wifi;
+    $("#discover").hidden = !wifi;
+    if (!wifi) $("#found").hidden = true;
     if ($("#noports")) $("#noports").hidden = wifi;
+    if (wifi && !st.connected && !searched) discover();
+  };
+  let searched = false;
+  const discover = async () => {
+    searched = true;
+    const b = $("#discover");
+    b.disabled = true; b.textContent = "Suche …";
+    const d = await api("/api/discover");
+    b.disabled = false; b.textContent = "Suchen";
+    const list = d.bridges || [];
+    const sel = $("#found");
+    if (!list.length) { sel.hidden = true; toast("Keine ESP32-Brücke im WLAN gefunden", "err"); return; }
+    sel.innerHTML = list.map((x) => `<option value="${h(x.ip)}">${h(x.host || x.ip)} · ${h(x.ip)} · v${h(x.version)}</option>`).join("");
+    sel.hidden = list.length < 2;
+    if (!list.some((x) => x.ip === $("#host").value || x.host === $("#host").value)) $("#host").value = list[0].ip;
+    toast(list.length === 1 ? `Brücke gefunden: ${list[0].host || list[0].ip}` : `${list.length} Brücken gefunden`);
   };
   if ($("#kind")) {
     const cur = st.port || "";
     $("#kind").value = cur.startsWith("esp:") ? "esp" : /^(https?:\/\/|.*\.local$|\d+\.\d+\.\d+\.\d+)/.test(cur) ? "wifi" : (kindPref.kind || "direct");
     $("#host").value = $("#kind").value === "wifi" && cur ? cur : (kindPref.host || "m18-bridge.local");
     if (cur.startsWith("esp:")) $("#port").value = cur.slice(4);
+    // An ESP32-S3 on USB and no previous choice: preselect it.
+    const espOpt = $$("#port option").find((o) => o.dataset.esp);
+    if (!cur && !kindPref.kind && espOpt) { $("#kind").value = "esp"; $("#port").value = espOpt.value; }
     $("#kind").onchange = syncKind;
+    $("#discover").onclick = discover;
+    $("#found").onchange = (e) => { $("#host").value = e.target.value; };
     syncKind();
   }
   const target = () => {

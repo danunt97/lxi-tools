@@ -10,6 +10,7 @@ unchanged.
     python m18_bridge.py --bridge COM7                 # ESP32 on USB
     python m18_bridge.py --bridge m18-bridge.local     # ESP32 over Wi-Fi
     python m18_bridge.py --bridge 192.168.1.50 --health
+    python m18_bridge.py --discover                    # find bridges on the network
 
 In Python:
     from m18_bridge import M18Bridge
@@ -17,6 +18,8 @@ In Python:
     m.health()
 """
 
+import json
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -77,7 +80,7 @@ class SerialLink:
             self.ser.flush()
             deadline = time.time() + timeout
             while True:
-                raw = self.ser.readline().decode("ascii", "replace").strip()
+                raw = self.ser.readline().decode("utf-8", "replace").strip()
                 if raw.startswith(("OK", "ERR")):
                     replies.append(raw)
                     break
@@ -109,7 +112,7 @@ class HttpLink:
                                      headers={"Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                out = resp.read().decode("ascii", "replace").splitlines()
+                out = resp.read().decode("utf-8", "replace").splitlines()
         except (urllib.error.URLError, OSError) as e:
             raise BridgeError(f"M18-Brücke {self.base} nicht erreichbar: {e}") from e
         out = [o.strip() for o in out if o.strip()]
@@ -119,6 +122,78 @@ class HttpLink:
 
     def close(self):
         pass
+
+
+DISCOVERY_PORT = 18018
+ESPRESSIF_USB_VID = 0x303A   # native USB of ESP32-S2/S3/C3
+
+
+def discover(timeout=1.5, targets=None):
+    """Find bridges on the local network (UDP broadcast "M18BRIDGE?" on port 18018).
+
+    Returns [{"host": "m18-bridge-ab12.local", "ip": "192.168.1.50", "version": "1.1", ...}].
+    """
+    targets = targets or ["255.255.255.255"] + _subnet_broadcasts()
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.bind(("", 0))
+        for t in targets:
+            try:
+                s.sendto(b"M18BRIDGE?", (t, DISCOVERY_PORT))
+            except OSError:
+                pass
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            s.settimeout(left)
+            try:
+                data, addr = s.recvfrom(512)
+            except (socket.timeout, OSError):
+                break
+            text = data.decode("ascii", "replace").strip()
+            if not text.startswith("M18BRIDGE "):
+                continue
+            parts = text.split()
+            info = {"version": parts[1] if len(parts) > 1 else ""}
+            for p in parts[2:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    info[k] = v
+            info["ip"] = info.get("ip") or addr[0]
+            info["reply_from"] = addr[0]
+            found[info.get("mac") or addr[0]] = info
+    finally:
+        s.close()
+    return sorted(found.values(), key=lambda i: i.get("host", ""))
+
+
+def _subnet_broadcasts():
+    """x.y.z.255 of the local IPv4 addresses (helps on Windows with several adapters)."""
+    out = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                out.add(ip.rsplit(".", 1)[0] + ".255")
+    except OSError:
+        pass
+    try:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.connect(("10.255.255.255", 1))
+        out.add(u.getsockname()[0].rsplit(".", 1)[0] + ".255")
+        u.close()
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def is_bridge_usb_port(p):
+    """True for serial ports that look like an ESP32-S3 (native USB)."""
+    return getattr(p, "vid", None) == ESPRESSIF_USB_VID
 
 
 def open_link(target):
@@ -170,6 +245,11 @@ class M18Bridge(m18.M18):
     def info(self):
         return self._one("INFO")
 
+    def scan(self):
+        """Let the bridge read and decode the battery itself; returns a dict."""
+        r = self.link.exec(["SCAN"], timeout=30)[0]
+        return json.loads(r[r.index("{"):]) if "{" in r else {"ok": False, "error": r}
+
     # -- not available through the bridge -----------------------------------
     def send(self, command):
         raise NotImplementedError("Über die ESP32-Brücke nicht verfügbar")
@@ -183,11 +263,19 @@ if __name__ == "__main__":
     import code
 
     ap = argparse.ArgumentParser(description="M18 über ESP32-Brücke")
-    ap.add_argument("--bridge", required=True,
+    ap.add_argument("--discover", action="store_true", help="Brücken im WLAN suchen und beenden")
+    ap.add_argument("--bridge",
                     help="serieller Port (z. B. COM7, /dev/ttyUSB0) oder Netzwerkadresse "
                          "(m18-bridge.local, 192.168.1.50, http://...)")
     ap.add_argument("--health", action="store_true", help="Health-Report ausgeben und beenden")
     args = ap.parse_args()
+    if args.discover or not args.bridge:
+        found = discover()
+        for b in found:
+            print(f"{b.get('host', '?'):28} {b['ip']:15} Firmware {b['version']}")
+        if not found:
+            print("Keine M18-Brücke im Netzwerk gefunden.")
+        raise SystemExit(0)
     m = M18Bridge(args.bridge)
     print(f"Verbunden mit M18-Brücke {m.target}: {m.info()}")
     if args.health:

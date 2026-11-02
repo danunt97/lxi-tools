@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path[:0] = [ROOT, os.path.join(ROOT, "gui")]
 
+import fleet  # noqa: E402
 import m18  # noqa: E402
 import m18_bridge  # noqa: E402
 import m18_gui  # noqa: E402
@@ -77,6 +78,18 @@ class TestBridge(unittest.TestCase):
         self.assertAlmostEqual(snap["temp"], 23.0, delta=0.5)   # 0x401F = 0 -> falls back to 0x4014
         self.assertEqual(snap["counters"]["overheat"], 2)
         self.assertEqual(snap["manufactured"][:10], "2022-03-14")
+        # Direct read-out on the bridge (SCAN) must match the PC's own decoding
+        sc = m.scan()
+        self.assertTrue(sc["ok"], sc)
+        self.assertEqual(sc["eserial"], snap["eserial"])
+        self.assertEqual(sc["cells_mv"], [round(v * 1000) for v in snap["cells"]])
+        self.assertEqual(sc["imbalance_mv"], snap["imbalance_mv"])
+        for k in ("total_charges", "overheat", "lowvolt", "discharge_as", "days", "tool_time_s"):
+            self.assertEqual(sc["counters"][k], snap["counters"][k], k)
+        now = fleet.parse_ts(sc["battery_date"])          # bridge has no NTP here -> battery clock
+        health, parts = fleet.health_estimate(snap, None, now)
+        self.assertEqual(sc["health"], health)
+        self.assertEqual([p["label"] for p in sc["health_parts"]], [p["label"] for p in parts])
         m.write_message("TEST-1")
         self.assertEqual(m.read_id([7], output="array")[0][1], '"TEST-1--------------"')
         m.idle()
@@ -87,12 +100,12 @@ class TestBridge(unittest.TestCase):
         class H(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["Content-Length"])).decode()
-                out = "\n".join(sim.exec([ln for ln in body.splitlines() if ln.strip()])) + "\n"
+                out = ("\n".join(sim.exec([ln for ln in body.splitlines() if ln.strip()])) + "\n").encode()
                 self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(out)))
                 self.end_headers()
-                self.wfile.write(out.encode())
+                self.wfile.write(out)
 
             def log_message(self, *a):
                 pass
@@ -131,6 +144,28 @@ class TestBridge(unittest.TestCase):
             p.kill()
             os.close(master)
             os.close(slave)
+
+    def test_discovery(self):
+        import socket
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            srv.bind(("127.0.0.1", m18_bridge.DISCOVERY_PORT))
+        except OSError:
+            self.skipTest("UDP port 18018 busy")
+
+        def responder():
+            data, addr = srv.recvfrom(64)
+            if data.startswith(b"M18BRIDGE?"):
+                srv.sendto(b"M18BRIDGE 1.1 host=m18-bridge-ab12.local ip=192.168.1.50 http=80 "
+                           b"mac=AA:BB:CC:DD:AB:12\n", addr)
+        t = threading.Thread(target=responder, daemon=True)
+        t.start()
+        found = m18_bridge.discover(timeout=1.0, targets=["127.0.0.1"])
+        srv.close()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["host"], "m18-bridge-ab12.local")
+        self.assertEqual(found[0]["ip"], "192.168.1.50")
+        self.assertEqual(found[0]["version"], "1.1")
 
     def test_target_detection(self):
         for t in ("m18-bridge.local", "192.168.1.50", "http://x:80"):
