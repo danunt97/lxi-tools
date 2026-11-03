@@ -98,7 +98,7 @@ class Reader {
     int fails = 0;
     for (int i = 0; i < NUM_BLOCKS; i++) {           // dummy pass: refreshes the 0x9000 RAM copy
       fails = readBlock(BLOCKS[i], buf, false) ? 0 : fails + 1;
-      progress_++;
+      progress_ = progress_ + 1;
       if (fails >= ABORT_AFTER_FAILS) { fail("Verbindung zum Akku abgebrochen", t0); return 0; }
     }
     link_.idle();
@@ -117,7 +117,7 @@ class Reader {
           okb = readBlock(BLOCKS[i], buf, true);
         }
       }
-      progress_++;
+      progress_ = progress_ + 1;
       if (okb) { answered_++; fails = 0; }
       else if (++fails >= ABORT_AFTER_FAILS) { fail("Verbindung zum Akku abgebrochen", t0); return answered_; }
     }

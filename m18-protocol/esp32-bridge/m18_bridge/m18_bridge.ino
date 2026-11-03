@@ -76,11 +76,11 @@ Preferences prefs;
 SemaphoreHandle_t batMutex;            // one user of the battery line at a time
 SemaphoreHandle_t stateMutex;          // protects lastScan
 SemaphoreHandle_t histMutex;           // protects the history store
-TaskHandle_t loopTaskHandle = nullptr;
+TaskHandle_t bridgeLoopTask = nullptr;
 
 // ---------------------------------------------------------- watchdog helper
 static inline void feedWdt() {
-  if (loopTaskHandle && xTaskGetCurrentTaskHandle() == loopTaskHandle) feedLoopWDT();
+  if (bridgeLoopTask && xTaskGetCurrentTaskHandle() == bridgeLoopTask) feedLoopWDT();
 }
 
 // ------------------------------------------------------------ battery port
@@ -382,7 +382,9 @@ const char* resetReason() {
     case ESP_RST_BROWNOUT: return "Unterspannung (Brownout)";
     case ESP_RST_DEEPSLEEP: return "Deep Sleep";
     case ESP_RST_EXT: return "Reset-Taste";
-    case ESP_RST_USB: return "USB";
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    case ESP_RST_USB: return "USB";          // not in ESP-IDF 4.4 (Arduino core 2.0.x)
+#endif
     default: return "unbekannt";
   }
 }
@@ -952,7 +954,7 @@ void setup() {
   stateMutex = xSemaphoreCreateMutex();
   histMutex = xSemaphoreCreateMutex();
   bootId = (uint32_t)random(1, 0x7FFFFFFF);   // hardware RNG (Arduino random() uses esp_random)
-  loopTaskHandle = xTaskGetCurrentTaskHandle();
+  bridgeLoopTask = xTaskGetCurrentTaskHandle();
 
   Serial.begin(HOST_BAUD);
 #if ARDUINO_USB_CDC_ON_BOOT
