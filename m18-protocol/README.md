@@ -1,115 +1,177 @@
-# M18 Protocol
+# M18 Akku-Verwaltung
 
-This repository contains research about the Milwaukee M18 protocol.
+[![Tests](https://github.com/danunt97/m18-protocol/actions/workflows/tests.yml/badge.svg)](https://github.com/danunt97/m18-protocol/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-Arduino-E7352C?logo=espressif&logoColor=white)
+![Ohne Abhängigkeiten](https://img.shields.io/badge/Abh%C3%A4ngigkeiten-nur%20pyserial-informational)
 
-First step was to fake the charger commands in order to verify that the communication works as expected. :white_check_mark: Next step was figuring out what other commands are supported. :white_check_mark:
+Mit diesem Tool **liest du Milwaukee-M18-Akkus aus, verwaltest sie in einer Datenbank und verfolgst ihre Alterung**.
+Das Programm läuft als lokaler Webserver auf dem eigenen PC, ohne Installation und ohne Cloud. Auf Wunsch übernimmt
+eine **ESP32-S3-Brücke** das Auslesen per WLAN oder direkt vor Ort mit dem Handy.
 
-While most of the registers and data are known, there are still some unknown. Contributions are welcome!
+Das Projekt baut auf der Protokoll-Forschung von [mnh-jansson/m18-protocol](https://github.com/mnh-jansson/m18-protocol) auf.
+
+![Flottenübersicht](docs/images/gui-flotte.png)
+
+## Funktionen
+
+**Akku-Verwaltung (PC, `gui/`)**
+- **Auslesen** über einen 3,3-V-USB-Seriell-Adapter oder die ESP32-Brücke. Bekannte Akkus erkennt das Programm automatisch, neue legt es mit einem Klick an.
+- **Datenbank (SQLite):** jede Messung mit Zeitstempel, allen Zählern und den rohen Registerwerten.
+- **Flottenübersicht:** Zustand, Verlauf, Trend, Zell-Imbalance, Zyklen, Standort, fällige Messungen und offene Warnungen. Die Liste lässt sich filtern und sortieren.
+- **Alterung:** Diagramme pro Akku und eine Prognose, wann der Akku schwach wird.
+- **Warnungen**, wenn sich ein Akku deutlich verschlechtert: Zustandsabfall, steigende Imbalance, neue Überhitzungs- oder Unterspannungs-Ereignisse, Ladung mit einer Zelle unter 2,5 V.
+- **Standort, Kommentar und Gehäuse-Seriennummer** sind editierbar; Akkus lassen sich ausmustern.
+- **QR-Etiketten** für P-touch (12–36 mm) und Brother QL (62 mm). Der QR-Code führt direkt zur Akku-Seite, der Code wird offline erzeugt.
+- **Berichte:** druckbare A4-Seite bzw. PDF pro Akku, CSV pro Akku oder für die ganze Flotte, Datenbank-Backup.
+- **Demo-Modus** mit 8 simulierten Akkus und 2 Jahren Verlauf, ganz ohne Hardware.
+
+**ESP32-S3-Akku-Brücke (`esp32-bridge/`)**
+- **Ersetzt den USB-Seriell-Adapter.** Der PC verbindet sich per USB oder WLAN und findet die Brücke im Netz automatisch.
+- **Eigene Weboberfläche fürs Handy:**
+  - Akku direkt auslesen, mit Zustand, Zellspannungen, Zählern und Daten
+  - WLAN-Einrichtung beim Kunden (Captive Portal)
+  - Verlauf, Status-LED, Firmware-Update im Browser
+- **Messungen offline speichern** (mehrere tausend im Flash) und später **in die PC-Datenbank übernehmen**. Dafür werden die Rohregister gespeichert; eine übernommene Messung ist gleichwertig mit einer am PC.
+- **Robust:**
+  - Wiederholungen und schneller Abbruch bei gezogenem Akku
+  - Watchdog
+  - J2 bleibt im Ruhezustand sicher auf Low, damit der Akku keine „Dumb Charge“ zählt
+- **Optionaler Passwortschutz.** Einstellungen ändern geht nur nach einem Druck auf die BOOT-Taste.
+
+## Bilder
+
+| Akku-Detail mit Alterungsverlauf | Auslesen und Vergleich mit der letzten Messung |
+|---|---|
+| ![Akku-Detail](docs/images/gui-akku-detail.png) | ![Auslesen](docs/images/gui-auslesen.png) |
+| **QR-Etiketten (P-touch 24 mm)** | **Druckbarer Bericht** |
+| ![Etiketten](docs/images/gui-etiketten.png) | ![Bericht](docs/images/gui-bericht.png) |
+
+**ESP32-Brücke am Handy:** WLAN einrichten, Akku auslesen, gespeicherte Messungen
+
+![ESP32-Brücke am Handy](docs/images/esp-handy.png)
+
+**Messungen der Brücke in die PC-Datenbank übernehmen**
+
+![Übernehmen](docs/images/gui-bruecke-uebernehmen.png)
+
+> Alle Bilder stammen aus dem Demo-Modus bzw. aus dem Simulator. Die Messwerte sind simuliert.
+
+## Schnellstart
+
+Du brauchst **Python 3.11 oder neuer**. Weitere Pakete braucht die Demo nicht.
+
+```bash
+git clone https://github.com/danunt97/m18-protocol.git
+```
+
+```bash
+cd m18-protocol
+```
+
+```bash
+python gui/m18_gui.py --demo
+```
+
+Danach öffnet sich der Browser mit http://127.0.0.1:8018. Unter Windows startest du mit `py gui\m18_gui.py --demo`.
+
+**Mit echtem Akku:**
+
+```bash
+pip install pyserial
+```
+
+```bash
+python gui/m18_gui.py
+```
+
+Dann **Auslesen** → Adapter wählen → **Verbinden** → **Akku auslesen** → speichern.
+Die Datenbank liegt in `data/m18_fleet.db`.
+
+Alle Optionen (`--host 0.0.0.0` für Handy-Scans im WLAN, `--db`, `--port` …) stehen in [gui/README.md](gui/README.md).
 
 ## Hardware
 
-In order to simulate the charger, the following circuit is proposed:
+Es gibt zwei Möglichkeiten, den Akku anzuschließen:
 
-**NOTE When using fake FT232 chips, break condition is not supported. The behaviour can be emulated by using the DTR line to pull the TX line low.**
+![Übersicht](docs/images/architektur.svg)
 
-List of [working and non-working devices](https://github.com/mnh-jansson/m18-protocol/discussions/16). Please add yours if not already listed.
+1. **3,3-V-USB-Seriell-Adapter** wie im ursprünglichen Projekt. Verdrahtung und Fehlersuche stehen in [docs/m18-protocol.md](docs/m18-protocol.md).
+2. **ESP32-S3-DevKitC-1 (N16R8) als Brücke.** Das bringt WLAN, Messen ohne PC und eine eigene Weboberfläche.
 
-The voltage of the USB to Serial adapter should be 3.3V
+![Verdrahtung ESP32-S3](docs/images/verdrahtung-esp32s3.svg)
 
-![hardware](docs/wiring.png)
+Flashen mit der Arduino IDE 2. Ins Werkzeuge-Menü gehören diese Einstellungen:
+- Board: **ESP32S3 Dev Module**
+- Flash: **16MB**
+- PSRAM: **OPI**
+- Partition: **16M Flash (3MB APP/9.9MB FATFS)**
+- USB CDC On Boot: **Enabled**
 
-## Requirements and Usage
+Danach `esp32-bridge/m18_bridge/m18_bridge.ino` hochladen. Alles Weitere zu WLAN-Einrichtung, LED, Passwort und Update
+steht in [esp32-bridge/README.md](esp32-bridge/README.md).
 
-To use this software, Python is required. Please read the [python](https://docs.python.org/3/) and [pip](https://pip.pypa.io/en/stable/installation/) documentation.
+> ⚠️ **Sicherheit:** Arbeiten an Li-Ion-Akkus auf eigene Gefahr. Die ESP32-Brücke kann nur lesen und die
+> 20-Zeichen-Notiz im Akku schreiben. Zähler, Kalibrierung oder Firmware des Akkus fasst sie nicht an.
 
-Install the required packages by running
+## Wie wird der Zustand bewertet?
 
-```bash
-pip install -r requirements.txt
+Der Akku speichert keinen echten State-of-Health. Die Software **schätzt** ihn aus den Verschleißzählern im Akku:
+100 Punkte minus Abzüge für
+- Zyklen (entladene Ah ÷ Nennkapazität)
+- Zell-Imbalance
+- Ladungen mit einer Zelle < 2,5 V
+- Überhitzung
+- Kalenderalter
+
+Jeder Abzug wird einzeln angezeigt.
+Aussagekräftig ist vor allem der **Verlauf über mehrere Messungen**. Details und Warnschwellen findest du in [gui/README.md](gui/README.md).
+
+## Projektstruktur
+
+```
+m18.py                  Protokoll und Kommandozeile (aus m18-protocol)
+m18_bridge.py           ESP32-Brücke als M18-Objekt (USB/WLAN), Suche, Abgleich
+gui/                    Akku-Verwaltung: Webserver, Datenbank, Alterung, QR, Berichte
+  m18_gui.py            Start: python gui/m18_gui.py [--demo]
+  fleet.py              SQLite, Zustandsschätzung, Warnungen, Trend
+  registers.py          Register → Messwerte (Live und Import identisch)
+  bridge_import.py      Messungen der Brücke übernehmen
+  qrgen.py              QR-Code-Encoder (reines Python)
+  static/               Oberfläche (HTML/CSS/JS, ohne Framework)
+esp32-bridge/
+  m18_bridge/           Arduino-Sketch + reine C++-Header (Protokoll, Auslesen, Speicher)
+  test/                 Simulator und Ende-zu-Ende-Tests
+docs/                   Bilder, ursprüngliche Protokoll-Doku, Register-Tabelle
 ```
 
-Once the required packages are installed, run the following command. If the serial port is known, specify it using `--port` to speed things up.
+## Tests
+
+Die Tests laufen ohne Hardware: Ein simulierter Akku spricht das echte Protokoll, und der C++-Kern der Firmware wird
+auf dem PC mitgetestet. GitHub Actions führt sie bei jedem Push aus und **kompiliert die Firmware für den ESP32-S3**
+mit den Arduino-Cores 2.x und 3.x.
 
 ```bash
-python3 m18.py
+python -m unittest discover -s gui/tests
 ```
-or on Windows
-```bash
-python.exe m18.py
-```
-
-Alternatively, use the [uv](https://docs.astral.sh/uv/) package manager to create an isolated virtual environment, install the correct version of Python, install dependencies, and execute the project:
 
 ```bash
-uv run m18.py
+g++ -std=c++17 -I esp32-bridge/m18_bridge esp32-bridge/test/sim_bridge.cpp -o sim_bridge
 ```
-
-
-This opens an interactive shell that can be used to send different commands. Refer to the instructions provided in the shell.
-
-## Output
-
-* Most users will just want to use `m.health()` for a simple health report. 
-* To see all registers, use `m.read_id()`
-* To output all registers in a format that can be copy/pasted into a spreadsheet, use `m.read_id(output="raw")`
-* To help us identify unknown registers, you can submit your diagnostics to us with `m.submit_form()`. This will prompt you for the 3 parts of the serial number, the type of battery (e.g. 3Ah high output), and other stuff that you can leave blank if you like
-
-A spreadsheet template can be found below. Do NOT request access, go to `File -> Make a copy` or `File -> Download`
-
-https://docs.google.com/spreadsheets/d/1rZZ3mtU2uwuo_uMv7O7hi5kyPA9AXUDU5CBsHKWMi-U/
-
-## Battery management web app (GUI)
-
-`gui/m18_gui.py` is a local web app on top of `m18.py`. It reads packs, stores every read-out with a
-timestamp in a SQLite database, and provides:
-
-- a fleet overview
-- aging trends and alerts when a pack gets noticeably worse
-- editable location and comment fields
-- printable QR labels (P-touch / Brother QL)
-- per-pack reports and CSV export
-
-It needs only `pyserial` plus the Python standard library.
 
 ```bash
-python gui/m18_gui.py          # real adapter
-python gui/m18_gui.py --demo   # simulated fleet, no hardware needed
+./sim_bridge test
 ```
-
-See [gui/README.md](gui/README.md) (German) for details.
-
-### ESP32 bridge
-
-Instead of a USB-serial adapter you can use an ESP32 ([esp32-bridge/](esp32-bridge/README.md)).
-It speaks the battery protocol itself and is reached over USB or Wi-Fi (`http://m18-bridge.local`).
-
-- `m18_bridge.py` exposes the ESP32 as an `M18` object.
-- In the GUI, choose "ESP32-Brücke" as the adapter.
 
 ```bash
-python m18_bridge.py --bridge m18-bridge.local --health
+python -m unittest esp32-bridge/test/test_bridge.py esp32-bridge/test/test_history.py
 ```
 
-## Windows Users
-There are 4 .bat files for Windows users that are not familiar with the command line. Double-click on them to run them.
-* `m18_idle.bat` will prompt you to select a serial device, then bring the TX (J2) pin low. This is recommended before connecting to the battery to avoid increasing the counter for dumb-charges
-* `m18_health.bat` will print out a simple health report. The adapter must be connected to the battery or you will get errors
-* `m18_interactive.bat` will put you into the interactive shell where you can call `m.health()`, `m.read_id()`, and submit your diagnostics to us with `m.submit_form()`
-* `m18_clipboard.bat` will fetch all diagnostic registers and copy them to the clipboard. You must right-click on this .bat file and select `Edit`, then change `--port COM5` to whatever your port is. Once finished, you can select a cell in a spreadsheet (for example, the template provided above), and ctrl+v to copy all the registers
+Die Brücken-Tests über USB brauchen `pyserial`, alles andere nur die Standardbibliothek.
 
-## Troubleshooting
-Some USB serial adapters don't give/receive the correct voltages when paired with M18 batteries. To test if this is your problem, connect adapter to battery then measure voltages between B- and J2 (next to B-) and J1 (next to B+). Then use the m.idle() and m.high() commands.
+## Grundlage und Hinweise
 
-You should see:
-* m.idle(): J2<1V, J1<1V
-* m.high(): J2>8V, J2>2V
-
-I get:
-* m.idle(): J2=0.13V, J1=0.81V
-* m.high(): J2=8.8V, J1=3.3V
-
-If m.idle() has J1 > 1V, then [this circuit](https://github.com/mnh-jansson/m18-protocol/issues/7#issuecomment-3312151944) by Spud2233 has fixed this issue for some people.
-![isolator](docs/spud_isolator.png)
-
-
-
+- Protokoll, Registertabelle und `m18.py` stammen aus [mnh-jansson/m18-protocol](https://github.com/mnh-jansson/m18-protocol)
+  und der Community dort. Die ursprüngliche Anleitung liegt in [docs/m18-protocol.md](docs/m18-protocol.md).
+- Kein offizielles Milwaukee-Produkt. „Milwaukee“ und „M18“ sind Marken ihrer jeweiligen Inhaber.
+- Änderungen stehen im [CHANGELOG](CHANGELOG.md).

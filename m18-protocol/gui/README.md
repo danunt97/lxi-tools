@@ -130,6 +130,6 @@ Register), `alerts` und `settings`. Die Versionierung läuft über `PRAGMA user_
 
 ## Screenshots (Demo-Modus)
 
-![Flotte](docs/flotte.png)
-![Akku-Detail](docs/akku-detail.png)
-![Auslesen](docs/auslesen.png)
+![Flotte](../docs/images/gui-flotte.png)
+![Akku-Detail](../docs/images/gui-akku-detail.png)
+![Auslesen](../docs/images/gui-auslesen.png)

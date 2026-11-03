@@ -951,7 +951,7 @@ void setup() {
   batMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
   histMutex = xSemaphoreCreateMutex();
-  bootId = esp_random();
+  bootId = (uint32_t)random(1, 0x7FFFFFFF);   // hardware RNG (Arduino random() uses esp_random)
   loopTaskHandle = xTaskGetCurrentTaskHandle();
 
   Serial.begin(HOST_BAUD);

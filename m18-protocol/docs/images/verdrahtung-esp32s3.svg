@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 470" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <style>
+    .board { fill: #1d3557; stroke: #5aa2ff; stroke-width: 2; }
+    .shift { fill: #6b1b26; stroke: #e4002b; stroke-width: 2; }
+    .bat   { fill: #26292d; stroke: #7a8088; stroke-width: 2; }
+    .pin   { fill: #d8dde3; font-size: 14px; font-family: Consolas, monospace; }
+    .t     { fill: #eceef0; font-size: 17px; font-weight: 700; }
+    .s     { fill: #b9bfc6; font-size: 12.5px; }
+    .w     { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; }
+    .dot   { stroke: #0d0e10; stroke-width: 1.5; }
+    .note  { fill: #e7b43a; font-size: 13px; }
+  </style>
+  <rect width="1000" height="470" rx="14" fill="#16181b"/>
+
+  <!-- ESP32-S3 -->
+  <rect class="board" x="30" y="60" width="220" height="330" rx="10"/>
+  <text class="t" x="140" y="92" text-anchor="middle">ESP32-S3</text>
+  <text class="s" x="140" y="112" text-anchor="middle">DevKitC-1 N16R8</text>
+  <text class="pin" x="236" y="168" text-anchor="end">GPIO17 (TX)</text>
+  <text class="pin" x="236" y="228" text-anchor="end">GPIO18 (RX)</text>
+  <text class="pin" x="236" y="288" text-anchor="end">3V3</text>
+  <text class="pin" x="236" y="348" text-anchor="end">GND</text>
+  <text class="s" x="140" y="380" text-anchor="middle">USB zum PC / Netzteil</text>
+
+  <!-- level shifter -->
+  <rect class="shift" x="390" y="120" width="190" height="260" rx="10"/>
+  <text class="t" x="485" y="150" text-anchor="middle">Pegelwandler</text>
+  <text class="s" x="485" y="168" text-anchor="middle">z. B. BSS138, 4 Kanal</text>
+  <text class="pin" x="402" y="208">LV1</text>   <text class="pin" x="568" y="208" text-anchor="end">HV1</text>
+  <text class="pin" x="402" y="288">LV</text>    <text class="pin" x="568" y="288" text-anchor="end">HV</text>
+  <text class="pin" x="402" y="348">GND</text>   <text class="pin" x="568" y="348" text-anchor="end">GND</text>
+
+  <!-- battery -->
+  <rect class="bat" x="760" y="80" width="200" height="320" rx="14"/>
+  <text class="t" x="860" y="112" text-anchor="middle">M18-Akku</text>
+  <text class="s" x="860" y="130" text-anchor="middle">Kontakte von oben</text>
+  <text class="pin" x="775" y="168">B+</text>
+  <text class="pin" x="775" y="208">J1</text>
+  <text class="pin" x="775" y="268">J2</text>
+  <text class="pin" x="775" y="348">B−</text>
+
+  <!-- TX: GPIO17 -> LV1 ; HV1 -> J2 -->
+  <path class="w" d="M250 163 H320 V203 H390" stroke="#3fcf7f"/>
+  <path class="w" d="M580 203 H660 V263 H760" stroke="#3fcf7f"/>
+  <!-- RX: J1 -> 1k -> GPIO18 -->
+  <path class="w" d="M760 203 H700 V60 H280 V223 H250" stroke="#5aa2ff"/>
+  <rect x="460" y="50" width="56" height="20" rx="4" fill="#16181b" stroke="#5aa2ff" stroke-width="2"/>
+  <text class="pin" x="488" y="65" text-anchor="middle" style="font-size:12px">1 kΩ</text>
+  <!-- 3V3 -> LV -->
+  <path class="w" d="M250 283 H390" stroke="#e05555"/>
+  <!-- B+ -> HV -->
+  <path class="w" d="M760 163 H720 V195 a 8 8 0 0 0 0 16 V283 H580" stroke="#f0a020"/>
+  <!-- GND -->
+  <path class="w" d="M250 343 H390" stroke="#9aa0a8"/>
+  <path class="w" d="M580 343 H760" stroke="#9aa0a8"/>
+  <!-- pull-down -->
+  <path class="w" d="M320 163 V120" stroke="#3fcf7f"/>
+  <rect x="300" y="88" width="40" height="32" rx="4" fill="#16181b" stroke="#3fcf7f" stroke-width="2"/>
+  <text class="pin" x="320" y="109" text-anchor="middle" style="font-size:11px">2,2k</text>
+  <text class="s" x="345" y="100">→ GND</text>
+
+  <text class="note" x="30" y="425">2,2 kΩ von GPIO17 nach GND hält J2 beim Booten auf Low (sonst zählt der Akku evtl. eine „Dumb Charge“).</text>
+  <text class="note" x="30" y="447">ESP32 über USB versorgen – nicht aus B+ (18–21 V). Pegelwandler-HV wie im Original-Schaltplan an B+.</text>
+</svg>
