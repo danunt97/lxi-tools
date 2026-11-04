@@ -1,0 +1,2 @@
+# Hantek DSO5072P / DSO5102P / DSO5202P: USB access for normal users
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="049f", ATTR{idProduct}=="505a", MODE="0666", TAG+="uaccess"
